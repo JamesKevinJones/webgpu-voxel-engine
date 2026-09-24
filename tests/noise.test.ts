@@ -1,8 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { BlockType } from '../src/world/block';
+import { BlockType, isOpaque } from '../src/world/block';
 import { CHUNK_SIZE, localIndex } from '../src/world/coords';
 import { fbm2, hash3, ridged2, simplex2, simplex3, smoothstep } from '../src/world/noise';
-import { SEA_LEVEL, generateChunkDense, surfaceHeight, terrainBlock, terrainHeight } from '../src/world/terrain';
+import {
+  BEACH_MAX_Y,
+  CAVE_MAX_Y,
+  CAVE_MIN_DENSITY,
+  CAVE_MIN_Y,
+  GRASS_MAX_Y,
+  SEA_LEVEL,
+  TREE_CELL,
+  WORLD_MIN_Y,
+  blockAt,
+  generateChunkDense,
+  isCave,
+  surfaceHeight,
+  targetHeight,
+  terrainDensity,
+  treeInCell,
+} from '../src/world/terrain';
 import { mulberry32 } from './helpers';
 
 describe('hash3', () => {
@@ -96,10 +112,14 @@ describe('simplex noise', () => {
 });
 
 describe('terrain', () => {
+  const seed = 1337;
+  const columns = (n: number): [number, number][] =>
+    Array.from({ length: n }, (_, i) => [((i * 7919) % 3000) - 1500, ((i * 104729) % 3000) - 1500]);
+
   it('generates identical chunks for identical seeds and different ones otherwise', () => {
-    const a = generateChunkDense(1, 0, -1, 1337);
-    const b = generateChunkDense(1, 0, -1, 1337);
-    const c = generateChunkDense(1, 0, -1, 1338);
+    const a = generateChunkDense(1, 0, -1, seed);
+    const b = generateChunkDense(1, 0, -1, seed);
+    const c = generateChunkDense(1, 0, -1, seed + 1);
     expect(a).toEqual(b);
     expect(a).not.toEqual(c);
   });
@@ -107,35 +127,112 @@ describe('terrain', () => {
   it('is seamless across chunk borders (pure function of world position)', () => {
     const left = generateChunkDense(-1, 0, 0, 5);
     const right = generateChunkDense(0, 0, 0, 5);
-    for (let y = 0; y < CHUNK_SIZE; y++) {
-      for (let z = 0; z < CHUNK_SIZE; z++) {
-        expect(left[localIndex(31, y, z)]).toBe(terrainBlock(-1, y, z, surfaceHeight(-1, z, 5), 5));
-        expect(right[localIndex(0, y, z)]).toBe(terrainBlock(0, y, z, surfaceHeight(0, z, 5), 5));
+    for (let y = 0; y < CHUNK_SIZE; y += 3) {
+      for (let z = 0; z < CHUNK_SIZE; z += 2) {
+        expect(left[localIndex(31, y, z)]).toBe(blockAt(-1, y, z, 5));
+        expect(right[localIndex(0, y, z)]).toBe(blockAt(0, y, z, 5));
       }
     }
   });
 
-  it('places water, surface layers and sky consistently', () => {
-    const seed = 1337;
-    for (let x = -200; x <= 200; x += 13) {
-      for (let z = -200; z <= 200; z += 17) {
-        const h = surfaceHeight(x, z, seed);
-        expect(h).toBe(Math.floor(terrainHeight(x, z, seed)));
-        const above = terrainBlock(x, h + 1, z, h, seed);
-        expect(above).toBe(h + 1 <= SEA_LEVEL ? BlockType.Water : BlockType.Air);
-        expect(terrainBlock(x, Math.max(h, SEA_LEVEL) + 1, z, h, seed)).toBe(BlockType.Air);
-        const top = terrainBlock(x, h, z, h, seed);
-        expect([BlockType.Grass, BlockType.Sand, BlockType.Stone]).toContain(top);
-        if (h <= SEA_LEVEL + 1) expect(top).toBe(BlockType.Sand);
+  it('has density strictly decreasing with height (no floating terrain)', () => {
+    let minStep = Infinity;
+    for (const [x, z] of columns(1500)) {
+      const t = targetHeight(x, z, seed);
+      for (let y = WORLD_MIN_Y; y < 110; y += 2) {
+        minStep = Math.min(minStep, terrainDensity(x, y, z, t, seed) - terrainDensity(x, y + 1, z, t, seed));
       }
     }
+    expect(minStep).toBeGreaterThan(0.1);
+  });
+
+  it('builds a solid column: nothing solid above the surface except trees', () => {
+    for (const [x, z] of columns(150)) {
+      const s = surfaceHeight(x, z, seed);
+      for (let y = s + 1; y < s + 12; y++) {
+        const b = blockAt(x, y, z, seed);
+        expect([BlockType.Air, BlockType.Water, BlockType.Wood, BlockType.Leaves]).toContain(b);
+        if (b === BlockType.Water) expect(y).toBeLessThanOrEqual(SEA_LEVEL);
+      }
+      expect(isOpaque(blockAt(x, s, z, seed))).toBe(true);
+    }
+  });
+
+  it('decorates the surface: grass, 3 dirt, then stone; sand on beaches and sea floors', () => {
+    let grassColumns = 0, sandColumns = 0;
+    for (const [x, z] of columns(400)) {
+      const s = surfaceHeight(x, z, seed);
+      const top = blockAt(x, s, z, seed);
+      if (s <= BEACH_MAX_Y) {
+        expect(top).toBe(BlockType.Sand);
+        sandColumns++;
+      } else if (s <= GRASS_MAX_Y) {
+        expect(top).toBe(BlockType.Grass);
+        grassColumns++;
+        for (const d of [1, 2, 3]) {
+          const layer = s - d <= BEACH_MAX_Y ? BlockType.Sand : BlockType.Dirt;
+          expect([layer, BlockType.Air]).toContain(blockAt(x, s - d, z, seed));
+        }
+        expect([BlockType.Stone, BlockType.Basalt, BlockType.Air]).toContain(blockAt(x, s - 5, z, seed));
+      } else {
+        expect(top).toBe(BlockType.Stone);
+      }
+    }
+    expect(grassColumns).toBeGreaterThan(50);
+    expect(sandColumns).toBeGreaterThan(50);
+  });
+
+  it('carves caves only inside their height band and well below the surface', () => {
+    let caves = 0;
+    for (const [x, z] of columns(60)) {
+      const t = targetHeight(x, z, seed);
+      for (let y = WORLD_MIN_Y; y < 60; y++) {
+        const d = terrainDensity(x, y, z, t, seed);
+        if (isCave(x, y, z, d, seed)) {
+          caves++;
+          expect(y).toBeGreaterThanOrEqual(CAVE_MIN_Y);
+          expect(y).toBeLessThanOrEqual(CAVE_MAX_Y);
+          expect(d).toBeGreaterThan(CAVE_MIN_DENSITY);
+          expect(blockAt(x, y, z, seed)).toBe(BlockType.Air);
+        }
+      }
+    }
+    expect(caves).toBeGreaterThan(0);
+  });
+
+  it('lays bedrock at the bottom of the world', () => {
+    for (const [x, z] of columns(100)) {
+      expect(blockAt(x, WORLD_MIN_Y, z, seed)).toBe(BlockType.Bedrock);
+      expect(blockAt(x, WORLD_MIN_Y + 3, z, seed)).not.toBe(BlockType.Bedrock);
+    }
+  });
+
+  it('grows trees on grass, fully inside their cell', () => {
+    let found = 0;
+    for (let cx = -10; cx < 10; cx++) {
+      for (let cz = -10; cz < 10; cz++) {
+        const tree = treeInCell(cx, cz, seed);
+        if (!tree) continue;
+        found++;
+        expect(Math.floor(tree.x / TREE_CELL)).toBe(cx);
+        expect(tree.x - 2).toBeGreaterThanOrEqual(cx * TREE_CELL);
+        expect(tree.x + 2).toBeLessThan((cx + 1) * TREE_CELL);
+        expect(tree.z - 2).toBeGreaterThanOrEqual(cz * TREE_CELL);
+        expect(tree.z + 2).toBeLessThan((cz + 1) * TREE_CELL);
+        expect(blockAt(tree.x, tree.base, tree.z, seed)).toBe(BlockType.Grass);
+        expect(blockAt(tree.x, tree.base + 1, tree.z, seed)).toBe(BlockType.Wood);
+        expect(blockAt(tree.x, tree.top + 1, tree.z, seed)).toBe(BlockType.Leaves);
+        expect(tree.top - tree.base).toBeGreaterThanOrEqual(4);
+      }
+    }
+    expect(found).toBeGreaterThan(20);
   });
 
   it('produces varied terrain with every block type somewhere', () => {
     const seen = new Set<number>();
-    for (const [cx, cy, cz] of [[0, 0, 0], [0, -1, 0], [0, -2, 0], [5, 0, 5], [-8, 1, 3], [12, 0, -12], [20, 1, 20], [-15, 0, -9]]) {
-      for (const v of generateChunkDense(cx!, cy!, cz!, 1337)) seen.add(v);
+    for (const [cx, cy, cz] of [[0, 0, 0], [0, -1, 0], [0, -2, 0], [5, 0, 5], [-8, 1, 3], [12, 0, -12], [3, -1, 2], [-4, 0, 5], [6, 0, -3]]) {
+      for (const v of generateChunkDense(cx!, cy!, cz!, seed)) seen.add(v);
     }
-    for (const b of Object.values(BlockType)) expect(seen.has(b)).toBe(true);
+    for (const b of Object.values(BlockType)) expect(seen.has(b), `block ${b}`).toBe(true);
   });
 });

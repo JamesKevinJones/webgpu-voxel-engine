@@ -7,12 +7,15 @@ export const BlockType = {
   Sand: 4,
   Water: 5,
   Basalt: 6,
+  Wood: 7,
+  Leaves: 8,
+  Bedrock: 9,
 } as const;
 
 export type BlockType = (typeof BlockType)[keyof typeof BlockType];
 
 /** Number of defined block types. */
-export const BLOCK_TYPE_COUNT = 7;
+export const BLOCK_TYPE_COUNT = 10;
 
 /**
  * Upper bound on block ids that fit the GPU voxel encoding (4 bits per palette index,
@@ -20,7 +23,7 @@ export const BLOCK_TYPE_COUNT = 7;
  */
 export const MAX_GPU_PALETTE = 16;
 
-export const BLOCK_NAMES: readonly string[] = ['Air', 'Stone', 'Dirt', 'Grass', 'Sand', 'Water', 'Basalt'];
+export const BLOCK_NAMES: readonly string[] = ['Air', 'Stone', 'Dirt', 'Grass', 'Sand', 'Water', 'Basalt', 'Wood', 'Leaves', 'Bedrock'];
 
 /** Opaque blocks hide faces behind them and contribute to ambient occlusion. */
 export function isOpaque(block: number): boolean {
@@ -30,6 +33,11 @@ export function isOpaque(block: number): boolean {
 /** Blocks that are drawn in the alpha-blended pass. */
 export function isTranslucent(block: number): boolean {
   return block === BlockType.Water;
+}
+
+/** Blocks the player cannot break. */
+export function isUnbreakable(block: number): boolean {
+  return block === BlockType.Bedrock;
 }
 
 /** Blocks a ray can hit / the player can target. */

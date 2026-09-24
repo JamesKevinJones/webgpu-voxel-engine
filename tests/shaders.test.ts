@@ -24,7 +24,7 @@ const modules: Record<string, { source: string; entryPoints: string[] }> = {
 };
 
 function stripComments(src: string): string {
-  return src.replace(/\/\/.*$/gm, '');
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 }
 
 describe('WGSL loader', () => {
@@ -94,7 +94,32 @@ describe('shader prelude', () => {
   });
 });
 
+// WGSL reserved words (spec §15.3) that are plausible identifier names.
+const WGSL_RESERVED = new Set(('NULL Self abstract active alignas alignof as asm asm_fragment async attribute auto await become ' +
+  'cast catch class co_await co_return co_yield coherent column_major common compile compile_fragment concept const_cast ' +
+  'consteval constexpr constinit crate debugger decltype delete demote demote_to_helper do dynamic_cast enum explicit export ' +
+  'extends extern external fallthrough filter final finally friend from fxgroup get goto groupshared highp impl implements ' +
+  'import inline instanceof interface layout lowp macro macro_rules match mediump meta mod module move mut mutable namespace ' +
+  'new nil noexcept noinline nointerpolation noperspective null nullptr of operator package packoffset partition pass patch ' +
+  'pixelfragment precise precision premerge priv protected pub public readonly ref regardless register reinterpret_cast ' +
+  'require resource restrict self set shared sizeof smooth snorm static static_assert static_cast std subroutine super target ' +
+  'template this thread_local throw trait try type typedef typeid typename typeof union unless unorm unsafe unsized use using ' +
+  'varying virtual volatile wgsl where with writeonly yield').split(' '));
+
 describe('shader modules', () => {
+  it('do not use reserved words as identifiers', () => {
+    for (const [file, { source }] of Object.entries(modules)) {
+      const code = stripComments(source);
+      const names = [
+        ...[...code.matchAll(/\b(?:let|var|const|fn|struct|override)\s+(\w+)/g)].map((m) => m[1]!),
+        ...[...code.matchAll(/[(,]\s*(\w+)\s*:/g)].map((m) => m[1]!), // parameters and struct members
+        ...[...code.matchAll(/^\s*(\w+)\s*:/gm)].map((m) => m[1]!),
+      ];
+      const bad = names.filter((n) => WGSL_RESERVED.has(n));
+      expect(bad, file).toEqual([]);
+    }
+  });
+
   it('expose the entry points the pipelines reference', () => {
     for (const [file, { source, entryPoints }] of Object.entries(modules)) {
       for (const ep of entryPoints) expect(source.replace(/\r/g, ''), `${file}: ${ep}`).toContain(ep);
@@ -128,7 +153,7 @@ describe('shader modules', () => {
 
 describe('CPU mirrors of GPU code', () => {
   const numbers = (src: string): number[] =>
-    [...stripComments(src).matchAll(/(?<![\w.])(\d+\.\d+|\d+)(?:u|i)?(?![\w.])/g)]
+    [...stripComments(src).replace(/array<[^>]*>/g, 'array').matchAll(/(?<![\w.])(\d+\.\d+|\d+)(?:u|i)?(?![\w.])/g)]
       .map((m) => Number.parseFloat(m[1]!))
       .filter((n) => n !== 0)
       .sort((a, b) => a - b);
@@ -141,10 +166,9 @@ describe('CPU mirrors of GPU code', () => {
 
   it('uses identical terrain parameters in terrain.ts and worldgen.wgsl', () => {
     const ts = read('src/world/terrain.ts');
-    const tsBody = ts.slice(ts.indexOf('export function terrainHeight'), ts.indexOf('/** Generates a dense chunk'))
-      .replace(/export function surfaceHeight[\s\S]*?\n}\n/, '');
+    const tsBody = ts.slice(ts.indexOf('const SPLINE_C'), ts.indexOf('/** Generates a dense chunk'));
     const wgsl = read('src/shaders/worldgen.wgsl');
-    const wgslBody = wgsl.slice(wgsl.indexOf('fn terrainHeight'), wgsl.indexOf('@compute'));
+    const wgslBody = wgsl.slice(wgsl.indexOf('fn continentalHeight'), wgsl.indexOf('@compute'));
     expect(numbers(wgslBody)).toEqual(numbers(tsBody));
   });
 });

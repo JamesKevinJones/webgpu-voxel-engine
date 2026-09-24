@@ -15,7 +15,18 @@ import {
   WATER_VERTEX_CAPACITY,
 } from '../world/mesh-format';
 import { GPU_DATA_OFFSET, GPU_PALETTE_OFFSET, GPU_SLOT_WORDS } from '../world/palette-chunk';
-import { SEA_LEVEL, WORLD_MIN_Y } from '../world/terrain';
+import {
+  BEACH_MAX_Y,
+  CAVE_MAX_Y,
+  CAVE_MIN_DENSITY,
+  CAVE_MIN_Y,
+  DETAIL_AMPLITUDE,
+  GRASS_MAX_Y,
+  SEA_LEVEL,
+  SURFACE_SEARCH,
+  TREE_CELL,
+  WORLD_MIN_Y,
+} from '../world/terrain';
 
 type WgslScalar = 'u32' | 'i32' | 'f32';
 
@@ -50,8 +61,19 @@ export const SHADER_CONSTANTS: readonly (readonly [string, number, WgslScalar])[
   ['BLOCK_SAND', BlockType.Sand, 'u32'],
   ['BLOCK_WATER', BlockType.Water, 'u32'],
   ['BLOCK_BASALT', BlockType.Basalt, 'u32'],
+  ['BLOCK_WOOD', BlockType.Wood, 'u32'],
+  ['BLOCK_LEAVES', BlockType.Leaves, 'u32'],
+  ['BLOCK_BEDROCK', BlockType.Bedrock, 'u32'],
   ['SEA_LEVEL', SEA_LEVEL, 'i32'],
   ['WORLD_MIN_Y', WORLD_MIN_Y, 'i32'],
+  ['BEACH_MAX_Y', BEACH_MAX_Y, 'i32'],
+  ['GRASS_MAX_Y', GRASS_MAX_Y, 'i32'],
+  ['CAVE_MIN_Y', CAVE_MIN_Y, 'i32'],
+  ['CAVE_MAX_Y', CAVE_MAX_Y, 'i32'],
+  ['CAVE_MIN_DENSITY', CAVE_MIN_DENSITY, 'f32'],
+  ['DETAIL_AMPLITUDE', DETAIL_AMPLITUDE, 'f32'],
+  ['SURFACE_SEARCH', SURFACE_SEARCH, 'i32'],
+  ['TREE_CELL', TREE_CELL, 'i32'],
 ];
 
 function literal(value: number, type: WgslScalar): string {
