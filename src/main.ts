@@ -20,6 +20,11 @@ function intParam(params: URLSearchParams, name: string, fallback: number, min: 
   return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
 }
 
+function floatParam(params: URLSearchParams, name: string, fallback: number): number {
+  const value = Number.parseFloat(params.get(name) ?? '');
+  return Number.isFinite(value) ? value : fallback;
+}
+
 const params = new URLSearchParams(location.search);
 const options = {
   seed: intParam(params, 'seed', DEFAULT_ENGINE_OPTIONS.seed, 0, 0x7fffffff),
@@ -27,6 +32,8 @@ const options = {
   generationBatch: intParam(params, 'gen', DEFAULT_ENGINE_OPTIONS.generationBatch, 1, 32),
   meshBatch: intParam(params, 'mesh', DEFAULT_ENGINE_OPTIONS.meshBatch, 1, 64),
   offscreen: params.get('offscreen') === '1',
+  timeOfDay: floatParam(params, 'time', DEFAULT_ENGINE_OPTIONS.timeOfDay),
+  dayLength: floatParam(params, 'daylen', DEFAULT_ENGINE_OPTIONS.dayLength),
 };
 
 try {

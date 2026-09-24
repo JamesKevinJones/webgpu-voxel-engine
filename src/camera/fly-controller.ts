@@ -54,11 +54,20 @@ export class FlyController {
   constructor(private readonly camera: Camera, private readonly input: InputState) {}
 
   update(dt: number): void {
+    this.look();
+    this.move(dt);
+  }
+
+  /** Applies accumulated mouse movement to the camera orientation (shared with walking mode). */
+  look(): void {
     const [mx, my] = this.input.consumeMouse(this.mouse);
     this.camera.yaw -= mx * this.sensitivity;
     this.camera.setPitch(this.camera.pitch - my * this.sensitivity);
     this.camera.yaw = wrapAngle(this.camera.yaw);
+  }
 
+  /** Free-fly translation with smoothed velocity. */
+  move(dt: number): void {
     const wheel = this.input.consumeWheel();
     if (wheel !== 0) this.baseSpeed = Math.min(400, Math.max(2, this.baseSpeed * Math.pow(0.85, wheel)));
 

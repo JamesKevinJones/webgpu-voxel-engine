@@ -19,6 +19,9 @@ export interface EngineStats {
   camera: { x: number; y: number; z: number; yaw: number; pitch: number };
   chunk: { x: number; y: number; z: number };
   speed: number;
+  mode: string;
+  grounded: string;
+  timeOfDay: string;
   target: string;
   placeBlock: string;
   seed: number;
@@ -35,6 +38,9 @@ export class StatsOverlay {
     root.classList.add('stats');
     const layout: [string, string][] = [
       ['fps', 'FPS'],
+      ['mode', 'Mode'],
+      ['grounded', 'Player'],
+      ['time', 'Time of day'],
       ['frame', 'Frame'],
       ['chunks', 'Chunks'],
       ['streaming', 'Streaming'],
@@ -68,6 +74,9 @@ export class StatsOverlay {
     if (now - this.lastUpdate < this.intervalMs) return;
     this.lastUpdate = now;
     this.set('fps', s.fps.toFixed(0));
+    this.set('mode', s.mode);
+    this.set('grounded', s.grounded);
+    this.set('time', s.timeOfDay);
     this.set('frame', `${s.frameMs.toFixed(2)} ms`);
     this.set('chunks', `${fmt.format(s.chunksLoaded)} ready`);
     this.set('streaming', `${s.chunksPending} queued · ${s.chunksGenerating} gen · ${s.meshQueue} mesh`);

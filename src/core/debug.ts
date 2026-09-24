@@ -1,3 +1,4 @@
+import { intersectsSolid } from '../physics/aabb';
 import { isOpaque } from '../world/block';
 import { CHUNK_SIZE, chunkKey } from '../world/coords';
 import { buildPaddedVolume, greedyMesh, type VoxelSource } from '../world/mesher';
@@ -24,6 +25,11 @@ export interface VoxelDebugApi {
   setBlock(x: number, y: number, z: number, block: number): boolean;
   /** Height of the topmost opaque voxel of a loaded column, or null. */
   surfaceAt(x: number, z: number): number | null;
+  /** Switches between 'freecam' and 'walk' (physics) mode. */
+  setMode(mode: 'freecam' | 'walk'): void;
+  /** Sets the time of day (0..1) and optionally pauses the clock. */
+  setTime(t: number, paused?: boolean): void;
+  player(): { x: number; y: number; z: number; grounded: boolean; inWater: boolean; embedded: boolean };
   /** PNG data URL of the last rendered frame (offscreen mode). */
   screenshot(): Promise<string>;
 }
@@ -93,6 +99,19 @@ export function installDebugApi(engine: Engine): VoxelDebugApi {
       const bottom = engine.chunks.config.minChunkY * CHUNK_SIZE;
       for (let y = top; y >= bottom; y--) if (isOpaque(engine.chunks.getBlock(x, y, z))) return y;
       return null;
+    },
+    setMode: (mode) => engine.setMode(mode),
+    setTime: (t, paused = true) => {
+      engine.timeOfDay = t - Math.floor(t);
+      engine.timePaused = paused;
+    },
+    player: () => {
+      const p = engine.player;
+      const solid = (x: number, y: number, z: number) => isOpaque(engine.chunks.getBlock(x, y, z));
+      return {
+        x: p.position[0]!, y: p.position[1]!, z: p.position[2]!,
+        grounded: p.grounded, inWater: p.inWater, embedded: intersectsSolid(p.bounds({ minX: 0, minY: 0, minZ: 0, maxX: 0, maxY: 0, maxZ: 0 }), solid),
+      };
     },
     screenshot: async () => {
       const frame = await engine.gpu.captureFrame();

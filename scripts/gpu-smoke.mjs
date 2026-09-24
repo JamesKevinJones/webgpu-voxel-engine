@@ -8,8 +8,9 @@
  *   - chunks were generated and meshed on the GPU,
  *   - worldgen.wgsl output matches the CPU terrain mirror (tolerating rare f32 rounding),
  *   - gather.wgsl + mesh.wgsl quad counts exactly match the CPU reference greedy mesher,
- *   - a CPU-side voxel edit is uploaded and re-meshed consistently.
- * A screenshot is written to scripts/out/smoke.png.
+ *   - a CPU-side voxel edit is uploaded and re-meshed consistently,
+ *   - walking mode lands the player on the terrain and walks without clipping into it.
+ * Screenshots (noon / dusk / night / walking) are written to scripts/out/.
  *
  * Usage: npm run build && npm run test:gpu   (needs Playwright + a Chromium build)
  */
@@ -145,15 +146,43 @@ try {
     writeFileSync(join(outDir, name), Buffer.from(png.split(',')[1], 'base64'));
     console.log(`screenshot: ${join(outDir, name)}`);
   };
+  await page.evaluate(() => globalThis.__voxel.setTime(0.5));
   await capture('overview.png');
-  // Ground-level view across the terrain (AO, materials, water, fog).
-  await page.evaluate(() => {
+  // Ground-level view across the terrain (textures, AO, water, fog) at noon, dusk and night.
+  const ground = await page.evaluate(() => {
     const v = globalThis.__voxel;
     const y = v.surfaceAt(20, 20) ?? 20;
-    v.teleport(20.5, Math.max(y, 12) + 6, 20.5, -2.3, -0.12);
+    v.teleport(20.5, Math.max(y, 0) + 6, 20.5, -2.3, -0.12);
+    return y;
   });
   await waitSettled(page, 'ground view');
-  await capture('ground.png');
+  await capture('ground-noon.png');
+  await page.evaluate(() => globalThis.__voxel.setTime(0.755));
+  await capture('ground-dusk.png');
+  await page.evaluate(() => globalThis.__voxel.setTime(0.02));
+  await capture('ground-night.png');
+  await page.evaluate(() => globalThis.__voxel.setTime(0.5));
+
+  // Walking mode: drop the player onto the terrain, then walk forward for a while.
+  await page.evaluate(() => globalThis.__voxel.setMode('walk'));
+  // Frame deltas are clamped to 0.1 s, so on a slow software GPU simulated time runs behind wall time.
+  const physicsSeconds = (seconds) => page.waitForTimeout(seconds * 1000);
+  await physicsSeconds(6);
+  const landed = await page.evaluate(() => globalThis.__voxel.player());
+  console.log(`player after drop: ${JSON.stringify(landed)} (surface ${ground})`);
+  if (landed.embedded) fail('player is embedded in terrain after landing');
+  if (!landed.grounded && !landed.inWater) fail('player did not land on the terrain');
+  await page.evaluate(() => globalThis.__voxel.engine.input.keys.add('KeyW'));
+  await physicsSeconds(6);
+  await page.evaluate(() => globalThis.__voxel.engine.input.keys.delete('KeyW'));
+  const walked = await page.evaluate(() => globalThis.__voxel.player());
+  const distance = Math.hypot(walked.x - landed.x, walked.z - landed.z);
+  console.log(`player after walking: ${JSON.stringify(walked)} moved ${distance.toFixed(2)} m`);
+  if (walked.embedded) fail('player clipped into terrain while walking');
+  if (distance < 1) fail('player did not move while walking');
+  await capture('walking.png');
+  await page.evaluate(() => globalThis.__voxel.setMode('freecam'));
+
   const finalStats = await page.evaluate(() => globalThis.__voxel.stats());
   console.log(`fps≈${finalStats.fps.toFixed(1)} (software rasteriser) · GPU pools ${finalStats.gpuMemoryMB.toFixed(0)} MB`);
 } catch (err) {

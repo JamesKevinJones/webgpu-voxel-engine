@@ -14,6 +14,7 @@ import {
   WATER_QUAD_CAPACITY,
   WATER_VERTEX_CAPACITY,
 } from '../world/mesh-format';
+import { TEXTURE_LAYERS } from './block-textures';
 import { GPU_DATA_OFFSET, GPU_PALETTE_OFFSET, GPU_SLOT_WORDS } from '../world/palette-chunk';
 import {
   BEACH_MAX_Y,
@@ -74,6 +75,7 @@ export const SHADER_CONSTANTS: readonly (readonly [string, number, WgslScalar])[
   ['DETAIL_AMPLITUDE', DETAIL_AMPLITUDE, 'f32'],
   ['SURFACE_SEARCH', SURFACE_SEARCH, 'i32'],
   ['TREE_CELL', TREE_CELL, 'i32'],
+  ...TEXTURE_LAYERS.map((name, i) => [`TEX_${name.toUpperCase()}`, i, 'i32'] as const),
 ];
 
 function literal(value: number, type: WgslScalar): string {

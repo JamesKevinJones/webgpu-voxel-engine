@@ -9,6 +9,7 @@ export class InputState {
   private mouseDY = 0;
   private wheel = 0;
   private clicks: number[] = [];
+  private presses: string[] = [];
   private readonly listeners: [EventTarget, string, EventListener][] = [];
 
   attach(canvas: HTMLCanvasElement): void {
@@ -19,6 +20,7 @@ export class InputState {
     on(window, 'keydown', (e) => {
       const ke = e as KeyboardEvent;
       this.keys.add(ke.code);
+      if (!ke.repeat) this.presses.push(ke.code);
       if (this.pointerLocked && ['Space', 'Tab'].includes(ke.code)) ke.preventDefault();
     });
     on(window, 'keyup', (e) => this.keys.delete((e as KeyboardEvent).code));
@@ -68,6 +70,18 @@ export class InputState {
     const w = this.wheel;
     this.wheel = 0;
     return w;
+  }
+
+  /** Key codes pressed (not auto-repeated) since the last call. */
+  consumePresses(): string[] {
+    const p = this.presses;
+    this.presses = [];
+    return p;
+  }
+
+  /** Test / automation hook: simulate a key press. */
+  injectPress(code: string): void {
+    this.presses.push(code);
   }
 
   consumeClicks(): number[] {

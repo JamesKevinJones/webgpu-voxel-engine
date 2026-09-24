@@ -87,7 +87,8 @@ export class GpuContext {
       label: 'depth buffer',
       size: { width, height },
       format: GpuContext.DEPTH_FORMAT,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      // Sampled by the water pass (read-only attachment) for depth-based transparency.
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.depthView = this.depthTexture.createView();
     if (this.offscreen) {

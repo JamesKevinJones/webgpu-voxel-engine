@@ -5,26 +5,39 @@ struct Frame {
   viewProj: mat4x4<f32>,
   invViewProj: mat4x4<f32>,
   cameraPos: vec4<f32>,   // xyz = eye position, w = time in seconds
-  sunDir: vec4<f32>,      // xyz = unit vector towards the sun, w = sun intensity
-  sunColor: vec4<f32>,    // rgb = linear sun colour
-  skyZenith: vec4<f32>,   // rgb = linear zenith colour
+  lightDir: vec4<f32>,    // xyz = unit vector towards the key light (sun or moon), w = intensity
+  lightColor: vec4<f32>,  // rgb = key light colour, w = daylight factor (0 night .. 1 day)
+  sunDir: vec4<f32>,      // xyz = unit vector towards the sun, w = sun visibility
+  sunColor: vec4<f32>,    // rgb = sun colour, w = moon visibility
+  skyZenith: vec4<f32>,   // rgb = linear zenith colour, w = star visibility
   skyHorizon: vec4<f32>,  // rgb = linear horizon colour
   fog: vec4<f32>,         // x = fog end distance, y = density, z = height falloff, w = fog base height
   viewport: vec4<f32>,    // xy = size in pixels, zw = 1 / size
+  clip: vec4<f32>,        // x = near plane, y = far plane
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 
 const PI: f32 = 3.14159265359;
+const MOON_COLOR: vec3<f32> = vec3<f32>(0.55, 0.65, 1.0);
 
-// Analytic sky: zenith/horizon gradient plus forward-scattering glow around the sun.
+fn hash31(p: vec3<f32>) -> f32 {
+  var q = fract(p * 0.1031);
+  q += dot(q, q.zyx + 31.32);
+  return fract((q.x + q.y) * q.z);
+}
+
+// Two-colour sky gradient (zenith ↔ horizon, both driven by the sun angle) plus forward-scattering
+// glow around the sun and a faint halo around the moon.
 fn skyColor(dir: vec3<f32>) -> vec3<f32> {
   let up = clamp(dir.y, -1.0, 1.0);
   let t = pow(clamp(up, 0.0, 1.0), 0.5);
   var col = mix(frame.skyHorizon.rgb, frame.skyZenith.rgb, t);
   col = mix(col, frame.skyHorizon.rgb * 0.7, clamp(-up * 2.5, 0.0, 1.0));
   let mu = max(dot(dir, frame.sunDir.xyz), 0.0);
-  col += frame.sunColor.rgb * (pow(mu, 8.0) * 0.18 + pow(mu, 96.0) * 0.6);
+  col += frame.sunColor.rgb * frame.sunDir.w * (pow(mu, 8.0) * 0.18 + pow(mu, 96.0) * 0.6);
+  let moonMu = max(dot(dir, -frame.sunDir.xyz), 0.0);
+  col += MOON_COLOR * frame.sunColor.w * pow(moonMu, 48.0) * 0.05;
   return col;
 }
 
@@ -36,6 +49,13 @@ fn fogAmount(world: vec3<f32>) -> f32 {
   let d = dist * frame.fog.y * (0.55 + 0.45 * heightTerm);
   let f = 1.0 - exp(-d * d);
   return max(f, smoothstep(frame.fog.x * 0.75, frame.fog.x, dist));
+}
+
+// Distance from the eye for a depth-buffer value of the WebGPU (z in [0,1]) perspective projection.
+fn linearDepth(depth: f32) -> f32 {
+  let n = frame.clip.x;
+  let f = frame.clip.y;
+  return n * f / (f - depth * (f - n));
 }
 
 // ACES filmic approximation (Narkowicz 2015).
