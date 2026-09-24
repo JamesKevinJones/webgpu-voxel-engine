@@ -1,6 +1,6 @@
 import { intersectsSolid } from '../physics/aabb';
 import { isOpaque } from '../world/block';
-import { CHUNK_SIZE, chunkKey } from '../world/coords';
+import { CHUNK_SIZE, chunkKey, worldToChunk } from '../world/coords';
 import { buildPaddedVolume, greedyMesh, type VoxelSource } from '../world/mesher';
 import { climateAt, generateChunkDense, surfaceHeight } from '../world/terrain';
 import type { Engine } from './engine';
@@ -60,15 +60,23 @@ export function runParityCheck(engine: Engine, maxChunks = 32): ParityReport {
     report.chunksCompared++;
 
     if (record.needsMesh || record.meshVersion === 0 || record.opaqueQuads < 0) continue;
+    // Only chunks whose 26 neighbours are all loaded: chunks at the streaming frontier keep meshes
+    // built while now-unloaded neighbours existed (their culled faces face away from the viewer),
+    // so the CPU mesher, which sees air there, would legitimately disagree.
     const neighbors: (VoxelSource | null)[] = [];
+    let complete = true;
     for (let dz = -1; dz <= 1; dz++) {
       for (let dy = -1; dy <= 1; dy++) {
         for (let dx = -1; dx <= 1; dx++) {
-          const n = chunks.chunks.get(chunkKey(record.cx + dx, record.cy + dy, record.cz + dz));
+          const cy = record.cy + dy;
+          const n = chunks.chunks.get(chunkKey(record.cx + dx, cy, record.cz + dz));
+          const inWorld = cy >= chunks.config.minChunkY && cy <= chunks.config.maxChunkY;
+          if (inWorld && (!n || n.state !== 'ready')) complete = false;
           neighbors.push(n && n.state === 'ready' && n.data ? n.data : null);
         }
       }
     }
+    if (!complete) continue;
     const cpu = greedyMesh(buildPaddedVolume(neighbors));
     report.meshesCompared++;
     if (cpu.opaqueQuads !== record.opaqueQuads || cpu.waterQuads !== record.waterQuads || cpu.cutoutQuads !== record.cutoutQuads) {
@@ -87,6 +95,9 @@ export function installDebugApi(engine: Engine): VoxelDebugApi {
     engine,
     stats: () => engine.collectStats(),
     settled: () => {
+      // Streaming must already be centred on the camera (a teleport takes effect on the next frame).
+      const c = engine.chunks.center, p = engine.camera.position;
+      if (c.x !== worldToChunk(p[0]!) || c.z !== worldToChunk(p[2]!)) return false;
       const s = engine.chunks.countByState();
       return s.pending === 0 && s.generating === 0 && engine.chunks.meshQueueSize === 0 &&
         [...engine.chunks.drawable()].every((r) => r.opaqueQuads >= 0);
