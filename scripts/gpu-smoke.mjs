@@ -138,11 +138,22 @@ try {
   if (edited === 0) fail('voxel edit had no effect');
   if (editMeshMismatches.length > 0) fail(`post-edit mesh mismatches: ${JSON.stringify(editMeshMismatches.slice(0, 5))}`);
 
-  await page.waitForTimeout(500);
   mkdirSync(outDir, { recursive: true });
-  const png = await page.evaluate(() => globalThis.__voxel.screenshot());
-  writeFileSync(join(outDir, 'smoke.png'), Buffer.from(png.split(',')[1], 'base64'));
-  console.log(`screenshot: ${join(outDir, 'smoke.png')}`);
+  const capture = async (name) => {
+    await page.waitForTimeout(400);
+    const png = await page.evaluate(() => globalThis.__voxel.screenshot());
+    writeFileSync(join(outDir, name), Buffer.from(png.split(',')[1], 'base64'));
+    console.log(`screenshot: ${join(outDir, name)}`);
+  };
+  await capture('overview.png');
+  // Ground-level view across the terrain (AO, materials, water, fog).
+  await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    const y = v.surfaceAt(20, 20) ?? 20;
+    v.teleport(20.5, Math.max(y, 12) + 6, 20.5, -2.3, -0.12);
+  });
+  await waitSettled(page, 'ground view');
+  await capture('ground.png');
   const finalStats = await page.evaluate(() => globalThis.__voxel.stats());
   console.log(`fps≈${finalStats.fps.toFixed(1)} (software rasteriser) · GPU pools ${finalStats.gpuMemoryMB.toFixed(0)} MB`);
 } catch (err) {

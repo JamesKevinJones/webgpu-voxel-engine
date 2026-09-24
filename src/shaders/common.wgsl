@@ -35,7 +35,7 @@ fn fogAmount(world: vec3<f32>) -> f32 {
   let heightTerm = exp(-max(world.y - frame.fog.w, 0.0) * frame.fog.z);
   let d = dist * frame.fog.y * (0.55 + 0.45 * heightTerm);
   let f = 1.0 - exp(-d * d);
-  return max(f, smoothstep(frame.fog.x * 0.8, frame.fog.x, dist));
+  return max(f, smoothstep(frame.fog.x * 0.75, frame.fog.x, dist));
 }
 
 // ACES filmic approximation (Narkowicz 2015).
@@ -48,7 +48,9 @@ fn tonemap(x: vec3<f32>) -> vec3<f32> {
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-// Linear HDR → display: tonemap then gamma encode (the swap chain format is not sRGB).
+const EXPOSURE: f32 = 1.15;
+
+// Linear HDR → display: exposure, tonemap, then gamma encode (the swap chain format is not sRGB).
 fn toDisplay(linear: vec3<f32>) -> vec3<f32> {
-  return pow(tonemap(linear), vec3<f32>(1.0 / 2.2));
+  return pow(tonemap(linear * EXPOSURE), vec3<f32>(1.0 / 2.2));
 }

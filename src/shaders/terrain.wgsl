@@ -143,8 +143,9 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, ao: f32, roughness: 
   let specular = distribution * geometry * fresnel / max(4.0 * nDotV * nDotL, 1e-3);
   let radiance = frame.sunColor.rgb * frame.sunDir.w;
   let direct = ((1.0 - fresnel) * albedo / PI + specular) * radiance * nDotL;
-  let skyAmbient = mix(frame.skyHorizon.rgb * 0.35, frame.skyZenith.rgb * 0.9, n.y * 0.5 + 0.5);
-  let bounce = vec3<f32>(0.10, 0.09, 0.07) * max(-n.y, 0.0);
+  // Hemispherical sky light: horizon-tinted from below, zenith-tinted from above.
+  let skyAmbient = mix(frame.skyHorizon.rgb * 0.5, frame.skyZenith.rgb * 0.7 + frame.skyHorizon.rgb * 0.35, n.y * 0.5 + 0.5);
+  let bounce = vec3<f32>(0.12, 0.10, 0.08) * max(-n.y, 0.0);
   let ambient = albedo * (skyAmbient + bounce) * ao;
   return direct * mix(0.5, 1.0, ao) + ambient;
 }

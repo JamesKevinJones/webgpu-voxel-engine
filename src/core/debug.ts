@@ -1,4 +1,5 @@
-import { chunkKey } from '../world/coords';
+import { isOpaque } from '../world/block';
+import { CHUNK_SIZE, chunkKey } from '../world/coords';
 import { buildPaddedVolume, greedyMesh, type VoxelSource } from '../world/mesher';
 import { generateChunkDense } from '../world/terrain';
 import type { Engine } from './engine';
@@ -21,6 +22,8 @@ export interface VoxelDebugApi {
   parity(maxChunks?: number): ParityReport;
   teleport(x: number, y: number, z: number, yaw?: number, pitch?: number): void;
   setBlock(x: number, y: number, z: number, block: number): boolean;
+  /** Height of the topmost opaque voxel of a loaded column, or null. */
+  surfaceAt(x: number, z: number): number | null;
   /** PNG data URL of the last rendered frame (offscreen mode). */
   screenshot(): Promise<string>;
 }
@@ -85,6 +88,12 @@ export function installDebugApi(engine: Engine): VoxelDebugApi {
       if (pitch !== undefined) engine.camera.setPitch(pitch);
     },
     setBlock: (x, y, z, block) => engine.chunks.setBlock(x, y, z, block),
+    surfaceAt: (x, z) => {
+      const top = (engine.chunks.config.maxChunkY + 1) * CHUNK_SIZE - 1;
+      const bottom = engine.chunks.config.minChunkY * CHUNK_SIZE;
+      for (let y = top; y >= bottom; y--) if (isOpaque(engine.chunks.getBlock(x, y, z))) return y;
+      return null;
+    },
     screenshot: async () => {
       const frame = await engine.gpu.captureFrame();
       const canvas = document.createElement('canvas');

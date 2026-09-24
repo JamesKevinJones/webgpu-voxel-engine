@@ -41,10 +41,10 @@ export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
   offscreen: false,
 };
 
-const SUN_DIRECTION = [0.42, 0.78, 0.3];
-const SUN_COLOR = [1.0, 0.94, 0.84];
-const SKY_ZENITH = [0.16, 0.34, 0.72];
-const SKY_HORIZON = [0.6, 0.72, 0.86];
+const SUN_DIRECTION = [0.45, 0.72, 0.36];
+const SUN_COLOR = [1.0, 0.93, 0.8];
+const SKY_ZENITH = [0.12, 0.3, 0.72];
+const SKY_HORIZON = [0.52, 0.66, 0.84];
 const PLACEABLE = [BlockType.Stone, BlockType.Dirt, BlockType.Grass, BlockType.Sand, BlockType.Water, BlockType.Basalt];
 const REACH = 8;
 /** CPU may run at most this many frames ahead of the GPU (backpressure for slow or offscreen GPUs). */
@@ -72,8 +72,8 @@ export class Engine {
   private readonly draws: { opaque: number[]; water: number[] } = { opaque: [], water: [] };
   private readonly sortScratch: { slot: number; d: number }[] = [];
   private readonly waterScratch: { slot: number; d: number }[] = [];
-  /** Resolves pending asynchronous readbacks; exposed for tooling/tests. */
-  private inflight = new Set<Promise<unknown>>();
+  /** Pending asynchronous readbacks (awaited by `flush`). */
+  private readonly inflight = new Set<Promise<unknown>>();
   lastError: unknown = null;
 
   private constructor(
@@ -103,7 +103,7 @@ export class Engine {
     this.camera.far = Math.max(600, fogEnd * 1.6);
     uniforms.setSun(SUN_DIRECTION, 3.1, SUN_COLOR);
     uniforms.setSky(SKY_ZENITH, SKY_HORIZON);
-    uniforms.setFog(fogEnd, 1.35 / fogEnd, 0.018, SEA_LEVEL);
+    uniforms.setFog(fogEnd, 0.8 / fogEnd, 0.02, SEA_LEVEL);
   }
 
   static async create(canvas: HTMLCanvasElement, overlayRoot: HTMLElement | null, options: Partial<EngineOptions> = {}): Promise<Engine> {
