@@ -1,10 +1,10 @@
 import { GpuContext, createShaderModule } from '../core/gpu-context';
 import skySource from '../shaders/sky.wgsl';
 import terrainSource from '../shaders/terrain.wgsl';
-import { INDIRECT_ARGS_BYTES, OPAQUE_VERTEX_CAPACITY, WATER_VERTEX_CAPACITY } from '../world/mesh-format';
+import { OPAQUE_VERTEX_CAPACITY, WATER_VERTEX_CAPACITY } from '../world/mesh-format';
 import { createBlockTextureArray } from './block-textures';
 import { withPrelude } from './shader-prelude';
-import type { WorldGpu } from './world-gpu';
+import { indirectOffset, type WorldGpu } from './world-gpu';
 
 export interface DrawLists {
   /** Mesh slots with opaque geometry, ideally sorted front to back. */
@@ -145,7 +145,7 @@ export class Renderer {
       pass.setIndexBuffer(this.world.indexBuffer, 'uint16');
       pass.setPipeline(this.opaquePipeline);
       pass.setBindGroup(0, this.opaqueBindGroup);
-      for (const slot of draws.opaque) pass.drawIndexedIndirect(this.world.opaqueArgs, slot * INDIRECT_ARGS_BYTES);
+      for (const slot of draws.opaque) pass.drawIndexedIndirect(this.world.indirectArgs, indirectOffset(slot, 0));
     }
     pass.end();
 
@@ -159,7 +159,7 @@ export class Renderer {
     water.setPipeline(this.waterPipeline);
     water.setBindGroup(0, this.waterBindGroup);
     water.setBindGroup(1, this.sceneDepthGroup(depthView));
-    for (const slot of draws.water) water.drawIndexedIndirect(this.world.waterArgs, slot * INDIRECT_ARGS_BYTES);
+    for (const slot of draws.water) water.drawIndexedIndirect(this.world.indirectArgs, indirectOffset(slot, 1));
     water.end();
   }
 

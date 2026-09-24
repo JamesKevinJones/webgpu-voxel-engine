@@ -153,7 +153,7 @@ describe('shader modules', () => {
 
 describe('CPU mirrors of GPU code', () => {
   const numbers = (src: string): number[] =>
-    [...stripComments(src).replace(/array<[^>]*>/g, 'array').matchAll(/(?<![\w.])(\d+\.\d+|\d+)(?:u|i)?(?![\w.])/g)]
+    [...stripComments(src).replace(/array<(?:[^<>]|<[^<>]*>)*>/g, 'array').replace(/\[\s*\d+\s*\]/g, '[]').matchAll(/(?<![\w.])(\d+\.\d+|\d+)(?:u|i)?(?![\w.])/g)]
       .map((m) => Number.parseFloat(m[1]!))
       .filter((n) => n !== 0)
       .sort((a, b) => a - b);
@@ -164,11 +164,13 @@ describe('CPU mirrors of GPU code', () => {
     expect(hex(noiseSource)).toEqual(hex(ts.slice(ts.indexOf('export function hash3'), ts.indexOf('function grad3'))));
   });
 
-  it('uses identical terrain parameters in terrain.ts and worldgen.wgsl', () => {
+  it('uses identical climate and terrain parameters in terrain.ts and climate/worldgen.wgsl', () => {
     const ts = read('src/world/terrain.ts');
-    const tsBody = ts.slice(ts.indexOf('const SPLINE_C'), ts.indexOf('/** Generates a dense chunk'));
+    const tsBody = ts.slice(ts.indexOf('export function temperatureAt'), ts.indexOf('/** Generates a dense chunk'));
+    const climate = read('src/shaders/climate.wgsl');
     const wgsl = read('src/shaders/worldgen.wgsl');
-    const wgslBody = wgsl.slice(wgsl.indexOf('fn continentalHeight'), wgsl.indexOf('@compute'));
+    const wgslBody = climate.slice(climate.indexOf('fn temperatureAt')) +
+      wgsl.slice(wgsl.indexOf('fn continentalHeight'), wgsl.indexOf('@compute'));
     expect(numbers(wgslBody)).toEqual(numbers(tsBody));
   });
 });

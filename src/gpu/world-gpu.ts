@@ -4,6 +4,7 @@ import type { GenerationJob, MeshJob } from '../world/chunk-manager';
 import {
   INDIRECT_ARGS_BYTES,
   INDIRECT_ARGS_WORDS,
+  CUTOUT_VERTEX_CAPACITY,
   MESH_COUNTER_WORDS,
   MESH_JOB_NEIGHBOR_OFFSET,
   MESH_JOB_WORDS,
@@ -22,7 +23,15 @@ import { withPrelude } from './shader-prelude';
 export const VOXEL_SLOT_BYTES = GPU_SLOT_WORDS * 4;
 export const OPAQUE_SLOT_BYTES = OPAQUE_VERTEX_CAPACITY * 4;
 export const WATER_SLOT_BYTES = WATER_VERTEX_CAPACITY * 4;
-/** One invocation per data word (8 voxels), 64 invocations per workgroup → 64 workgroups per chunk. */
+export const CUTOUT_SLOT_BYTES = CUTOUT_VERTEX_CAPACITY * 4;
+/** Number of vertex pools (opaque, water, cutout) and indirect records per mesh slot. */
+export const MESH_POOL_COUNT = 3;
+/** Byte offset of a slot's drawIndexedIndirect record for `pool` in `indirectArgs`. */
+export function indirectOffset(slot: number, pool: number): number {
+  return (slot * MESH_POOL_COUNT + pool) * INDIRECT_ARGS_BYTES;
+}
+const POOL_VERTEX_CAPACITY = [OPAQUE_VERTEX_CAPACITY, WATER_VERTEX_CAPACITY, CUTOUT_VERTEX_CAPACITY] as const;
+/** One invocation per data word (4 voxels at 8 bits), 64 invocations per workgroup → 128 workgroups per chunk. */
 const GEN_WORKGROUPS_PER_CHUNK = GPU_DATA_WORDS / 64;
 const GATHER_WORKGROUPS = Math.ceil(PADDED_WORDS / 64);
 
@@ -57,8 +66,9 @@ export class WorldGpu {
   readonly voxelPool: GPUBuffer;
   readonly opaqueVertices: GPUBuffer;
   readonly waterVertices: GPUBuffer;
-  readonly opaqueArgs: GPUBuffer;
-  readonly waterArgs: GPUBuffer;
+  readonly cutoutVertices: GPUBuffer;
+  /** drawIndexedIndirect records, MESH_POOL_COUNT per mesh slot (see `indirectOffset`). */
+  readonly indirectArgs: GPUBuffer;
   readonly counters: GPUBuffer;
   readonly chunkOrigins: GPUBuffer;
   readonly indexBuffer: GPUBuffer;
@@ -68,7 +78,7 @@ export class WorldGpu {
   private readonly meshJobs: GPUBuffer;
   private readonly genJobData: Int32Array<ArrayBuffer>;
   private readonly meshJobData: Uint32Array<ArrayBuffer>;
-  private readonly argsReset = new Uint32Array(INDIRECT_ARGS_WORDS);
+  private readonly argsReset = new Uint32Array(INDIRECT_ARGS_WORDS * MESH_POOL_COUNT);
   private readonly counterReset = new Uint32Array(MESH_COUNTER_WORDS);
   private readonly originData = new Int32Array(4);
   private readonly uploadScratch = new Uint32Array(GPU_SLOT_WORDS);
@@ -92,9 +102,12 @@ export class WorldGpu {
     });
     this.opaqueVertices = device.createBuffer({ label: 'opaque vertex pool', size: meshSlots * OPAQUE_SLOT_BYTES, usage: storage });
     this.waterVertices = device.createBuffer({ label: 'water vertex pool', size: meshSlots * WATER_SLOT_BYTES, usage: storage });
-    const argsUsage = storage | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST;
-    this.opaqueArgs = device.createBuffer({ label: 'opaque indirect args', size: meshSlots * INDIRECT_ARGS_BYTES, usage: argsUsage });
-    this.waterArgs = device.createBuffer({ label: 'water indirect args', size: meshSlots * INDIRECT_ARGS_BYTES, usage: argsUsage });
+    this.cutoutVertices = device.createBuffer({ label: 'cutout vertex pool', size: meshSlots * CUTOUT_SLOT_BYTES, usage: storage });
+    this.indirectArgs = device.createBuffer({
+      label: 'indirect args',
+      size: meshSlots * MESH_POOL_COUNT * INDIRECT_ARGS_BYTES,
+      usage: storage | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
+    });
     this.counters = device.createBuffer({
       label: 'mesh quad counters',
       size: meshSlots * MESH_COUNTER_WORDS * 4,
@@ -118,16 +131,15 @@ export class WorldGpu {
     this.indexBuffer.unmap();
 
     // Every indirect record starts as an empty draw with the slot's base vertex.
-    const initArgs = (buffer: GPUBuffer, capacity: number): void => {
-      const data = new Uint32Array(meshSlots * INDIRECT_ARGS_WORDS);
-      for (let s = 0; s < meshSlots; s++) {
-        data[s * INDIRECT_ARGS_WORDS + 1] = 1;
-        data[s * INDIRECT_ARGS_WORDS + 3] = s * capacity;
+    const initArgs = new Uint32Array(meshSlots * MESH_POOL_COUNT * INDIRECT_ARGS_WORDS);
+    for (let s = 0; s < meshSlots; s++) {
+      for (let p = 0; p < MESH_POOL_COUNT; p++) {
+        const o = (s * MESH_POOL_COUNT + p) * INDIRECT_ARGS_WORDS;
+        initArgs[o + 1] = 1;
+        initArgs[o + 3] = s * POOL_VERTEX_CAPACITY[p]!;
       }
-      device.queue.writeBuffer(buffer, 0, data);
-    };
-    initArgs(this.opaqueArgs, OPAQUE_VERTEX_CAPACITY);
-    initArgs(this.waterArgs, WATER_VERTEX_CAPACITY);
+    }
+    device.queue.writeBuffer(this.indirectArgs, 0, initArgs);
     device.queue.writeBuffer(this.genParams, 0, new Uint32Array([config.seed >>> 0, 0, 0, 0]));
 
     this.genBindGroup = device.createBindGroup({
@@ -156,8 +168,8 @@ export class WorldGpu {
         { binding: 1, resource: { buffer: this.meshJobs } },
         { binding: 2, resource: { buffer: this.opaqueVertices } },
         { binding: 3, resource: { buffer: this.waterVertices } },
-        { binding: 4, resource: { buffer: this.opaqueArgs } },
-        { binding: 5, resource: { buffer: this.waterArgs } },
+        { binding: 4, resource: { buffer: this.cutoutVertices } },
+        { binding: 5, resource: { buffer: this.indirectArgs } },
         { binding: 6, resource: { buffer: this.counters } },
       ],
     });
@@ -179,8 +191,8 @@ export class WorldGpu {
 
   /** Bytes allocated for all pools (for the stats overlay). */
   get allocatedBytes(): number {
-    return this.voxelPool.size + this.opaqueVertices.size + this.waterVertices.size + this.opaqueArgs.size +
-      this.waterArgs.size + this.counters.size + this.chunkOrigins.size + this.padded.size + this.indexBuffer.size;
+    return this.voxelPool.size + this.opaqueVertices.size + this.waterVertices.size + this.cutoutVertices.size +
+      this.indirectArgs.size + this.counters.size + this.chunkOrigins.size + this.padded.size + this.indexBuffer.size;
   }
 
   /**
@@ -212,8 +224,8 @@ export class WorldGpu {
 
   /**
    * Encodes gather + greedy-mesh passes for `jobs`. Each job's indirect records and counters are
-   * reset first; afterwards the two quad counters of every job are copied into `staging`
-   * (job i at byte offset i * 8).
+   * reset first; afterwards the quad counters of every job are copied into `staging`
+   * (job i at byte offset i * MESH_COUNTER_WORDS * 4).
    */
   encodeMeshing(encoder: GPUCommandEncoder, jobs: readonly MeshJob[], staging: GPUBuffer | null): void {
     if (jobs.length === 0) return;
@@ -226,10 +238,10 @@ export class WorldGpu {
       jobData[i * MESH_JOB_WORDS] = slot;
       jobData.set(job.neighborSlots, i * MESH_JOB_WORDS + MESH_JOB_NEIGHBOR_OFFSET);
 
-      this.argsReset.set([0, 1, 0, slot * OPAQUE_VERTEX_CAPACITY, 0]);
-      queue.writeBuffer(this.opaqueArgs, slot * INDIRECT_ARGS_BYTES, this.argsReset);
-      this.argsReset.set([0, 1, 0, slot * WATER_VERTEX_CAPACITY, 0]);
-      queue.writeBuffer(this.waterArgs, slot * INDIRECT_ARGS_BYTES, this.argsReset);
+      for (let p = 0; p < MESH_POOL_COUNT; p++) {
+        this.argsReset.set([0, 1, 0, slot * POOL_VERTEX_CAPACITY[p]!, 0], p * INDIRECT_ARGS_WORDS);
+      }
+      queue.writeBuffer(this.indirectArgs, indirectOffset(slot, 0), this.argsReset);
       queue.writeBuffer(this.counters, slot * MESH_COUNTER_WORDS * 4, this.counterReset);
       this.originData.set([job.record.cx * CHUNK_SIZE, job.record.cy * CHUNK_SIZE, job.record.cz * CHUNK_SIZE, 0]);
       queue.writeBuffer(this.chunkOrigins, slot * 16, this.originData);
@@ -262,7 +274,7 @@ export class WorldGpu {
   }
 
   destroy(): void {
-    for (const b of [this.voxelPool, this.opaqueVertices, this.waterVertices, this.opaqueArgs, this.waterArgs, this.counters,
+    for (const b of [this.voxelPool, this.opaqueVertices, this.waterVertices, this.cutoutVertices, this.indirectArgs, this.counters,
       this.chunkOrigins, this.indexBuffer, this.padded, this.genParams, this.genJobs, this.meshJobs]) {
       b.destroy();
     }

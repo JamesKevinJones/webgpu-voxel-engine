@@ -9,19 +9,23 @@
 //  Phase 2  Each invocation owns one run-start column and merges vertically adjacent runs with
 //           identical start, length and key into a single quad.
 //
-// Quads are appended to the chunk's fixed-capacity region of the vertex pool through atomic
-// counters, and the matching drawIndexedIndirect record's indexCount is bumped atomically.
-// The same algorithm is implemented on the CPU in src/world/mesher.ts.
+// Quads are appended to the chunk's fixed-capacity region of one of three vertex pools (opaque,
+// water, cutout) through atomic counters, and the matching drawIndexedIndirect record's indexCount
+// is bumped atomically. Cross plants (tall grass, flowers) are emitted as two diagonal quads by the
+// +X workgroups. The same algorithm is implemented on the CPU in src/world/mesher.ts.
 
 @group(0) @binding(0) var<storage, read> padded: array<u32>;
 @group(0) @binding(1) var<storage, read> jobs: array<u32>;
 @group(0) @binding(2) var<storage, read_write> opaqueVertices: array<u32>;
 @group(0) @binding(3) var<storage, read_write> waterVertices: array<u32>;
-@group(0) @binding(4) var<storage, read_write> opaqueArgs: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read_write> waterArgs: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> cutoutVertices: array<u32>;
+// drawIndexedIndirect records: MESH_POOLS per slot, pool order opaque, water, cutout.
+@group(0) @binding(5) var<storage, read_write> indirectArgs: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> counters: array<atomic<u32>>;
 
-const AO_OPEN_KEY: u32 = 0xff0u; // all four corners unoccluded (level 3)
+// Face key: block id in bits 0..4, four 2-bit corner AO levels in bits 5..12.
+const KEY_AO_SHIFT: u32 = 5u;
+const AO_OPEN_KEY: u32 = 0x1fe0u; // all four corners unoccluded (level 3)
 
 var<workgroup> runs: array<u32, 1024>;
 var<private> paddedBase: u32;
@@ -33,7 +37,22 @@ fn sampleVoxel(p: vec3<i32>) -> u32 {
 }
 
 fn isOpaqueBlock(b: u32) -> bool {
-  return b != BLOCK_AIR && b != BLOCK_WATER;
+  return blockRenderClass(b) == RC_OPAQUE;
+}
+
+// Mirrors isFaceVisible() in src/world/block.ts.
+fn isFaceVisible(block: u32, neighbor: u32) -> bool {
+  let cls = blockRenderClass(block);
+  if (cls == RC_OPAQUE) {
+    return !isOpaqueBlock(neighbor);
+  }
+  if (cls == RC_CUTOUT) {
+    return !isOpaqueBlock(neighbor) && neighbor != block;
+  }
+  if (cls == RC_WATER) {
+    return neighbor == BLOCK_AIR || blockRenderClass(neighbor) == RC_CROSS;
+  }
+  return false;
 }
 
 fn occluder(p: vec3<i32>) -> u32 {
@@ -60,12 +79,10 @@ fn faceKey(dir: u32, s: i32, i: i32, j: i32) -> u32 {
   }
   let q = p + axisVector(a) * select(1, -1, (dir & 1u) == 1u);
   let neighbor = sampleVoxel(q);
-  let opaque = isOpaqueBlock(block);
-  let visible = select(neighbor == BLOCK_AIR, !isOpaqueBlock(neighbor), opaque);
-  if (!visible) {
+  if (!isFaceVisible(block, neighbor)) {
     return 0u;
   }
-  if (!opaque) {
+  if (block == BLOCK_WATER) {
     return block | AO_OPEN_KEY;
   }
   let U = axisVector(u);
@@ -78,32 +95,71 @@ fn faceKey(dir: u32, s: i32, i: i32, j: i32) -> u32 {
     let side2 = occluder(q + V * dv);
     let corner = occluder(q + U * du + V * dv);
     let ao = select(3u - (side1 + side2 + corner), 0u, side1 == 1u && side2 == 1u);
-    key |= ao << (4u + c * 2u);
+    key |= ao << (KEY_AO_SHIFT + c * 2u);
   }
   return key;
 }
 
+// Reserves a quad in the pool of `block`; returns the first vertex index, or 0xffffffff when full.
+fn reserveQuad(slot: u32, pool: u32) -> u32 {
+  let quad = atomicAdd(&counters[slot * MESH_COUNTER_WORDS + pool], 1u);
+  var capacity = OPAQUE_QUAD_CAPACITY;
+  var vertexCapacity = OPAQUE_VERTEX_CAPACITY;
+  if (pool == 1u) {
+    capacity = WATER_QUAD_CAPACITY;
+    vertexCapacity = WATER_VERTEX_CAPACITY;
+  } else if (pool == 2u) {
+    capacity = CUTOUT_QUAD_CAPACITY;
+    vertexCapacity = CUTOUT_VERTEX_CAPACITY;
+  }
+  if (quad >= capacity) {
+    return 0xffffffffu; // Slot full: the overflow is visible to the CPU through the counter.
+  }
+  atomicAdd(&indirectArgs[(slot * MESH_POOLS + pool) * INDIRECT_ARGS_WORDS], 6u);
+  return slot * vertexCapacity + quad * 4u;
+}
+
+fn writeVertex(pool: u32, index: u32, packed: u32) {
+  if (pool == 0u) {
+    opaqueVertices[index] = packed;
+  } else if (pool == 1u) {
+    waterVertices[index] = packed;
+  } else {
+    cutoutVertices[index] = packed;
+  }
+}
+
+fn poolOf(block: u32) -> u32 {
+  let cls = blockRenderClass(block);
+  if (cls == RC_WATER) {
+    return 1u;
+  }
+  if (cls == RC_CUTOUT || cls == RC_CROSS) {
+    return 2u;
+  }
+  return 0u;
+}
+
 fn emitQuad(slot: u32, dir: u32, s: u32, i: u32, j: u32, w: u32, h: u32, key: u32) {
-  let block = key & 15u;
-  let water = block == BLOCK_WATER;
-  let quad = atomicAdd(&counters[slot * MESH_COUNTER_WORDS + select(0u, 1u, water)], 1u);
-  if (quad >= select(OPAQUE_QUAD_CAPACITY, WATER_QUAD_CAPACITY, water)) {
-    return; // Slot full: the overflow is visible to the CPU through the counter.
+  let block = key & 31u;
+  let pool = poolOf(block);
+  let base = reserveQuad(slot, pool);
+  if (base == 0xffffffffu) {
+    return;
   }
   let a = dir >> 1u;
   let u = (a + 1u) % 3u;
   let v = (a + 2u) % 3u;
   let negative = (dir & 1u) == 1u;
   let plane = select(s + 1u, s, negative);
-  let ao = vec4<u32>((key >> 4u) & 3u, (key >> 6u) & 3u, (key >> 8u) & 3u, (key >> 10u) & 3u);
+  let ao = vec4<u32>(
+    (key >> KEY_AO_SHIFT) & 3u,
+    (key >> (KEY_AO_SHIFT + 2u)) & 3u,
+    (key >> (KEY_AO_SHIFT + 4u)) & 3u,
+    (key >> (KEY_AO_SHIFT + 6u)) & 3u,
+  );
   // Rotate the quad so its shared diagonal joins the brighter corners (AO anisotropy fix).
   let rotate = select(0u, 1u, ao.x + ao.z < ao.y + ao.w);
-  var base = 0u;
-  if (water) {
-    base = slot * WATER_VERTEX_CAPACITY + quad * 4u;
-  } else {
-    base = slot * OPAQUE_VERTEX_CAPACITY + quad * 4u;
-  }
   for (var k = 0u; k < 4u; k++) {
     let order = (k + rotate) & 3u;
     // Positive faces: (0,0) (1,0) (1,1) (0,1); negative faces reverse the winding.
@@ -114,17 +170,29 @@ fn emitQuad(slot: u32, dir: u32, s: u32, i: u32, j: u32, w: u32, h: u32, key: u3
     pos[a] = plane;
     pos[u] = i + cu * w;
     pos[v] = j + cv * h;
-    let packed = pos.x | (pos.y << 6u) | (pos.z << 12u) | (dir << 18u) | (ao[corner] << 21u) | (block << 23u);
-    if (water) {
-      waterVertices[base + k] = packed;
-    } else {
-      opaqueVertices[base + k] = packed;
-    }
+    writeVertex(pool, base + k, packVertex(pos, dir, ao[corner], block));
   }
-  if (water) {
-    atomicAdd(&waterArgs[slot * INDIRECT_ARGS_WORDS], 6u);
-  } else {
-    atomicAdd(&opaqueArgs[slot * INDIRECT_ARGS_WORDS], 6u);
+}
+
+fn packVertex(p: vec3<u32>, face: u32, ao: u32, block: u32) -> u32 {
+  return p.x | (p.y << 6u) | (p.z << 12u) | (face << 18u) | (ao << 21u) | (block << 23u);
+}
+
+// Two diagonal quads (face codes 6 and 7) for a cross plant at cell p. Mirrors emitCross().
+fn emitCross(slot: u32, p: vec3<u32>, block: u32) {
+  let a = reserveQuad(slot, 2u);
+  if (a != 0xffffffffu) {
+    writeVertex(2u, a, packVertex(p, 6u, 3u, block));
+    writeVertex(2u, a + 1u, packVertex(p + vec3<u32>(1u, 0u, 1u), 6u, 3u, block));
+    writeVertex(2u, a + 2u, packVertex(p + vec3<u32>(1u, 1u, 1u), 6u, 3u, block));
+    writeVertex(2u, a + 3u, packVertex(p + vec3<u32>(0u, 1u, 0u), 6u, 3u, block));
+  }
+  let b = reserveQuad(slot, 2u);
+  if (b != 0xffffffffu) {
+    writeVertex(2u, b, packVertex(p + vec3<u32>(1u, 0u, 0u), 7u, 3u, block));
+    writeVertex(2u, b + 1u, packVertex(p + vec3<u32>(0u, 0u, 1u), 7u, 3u, block));
+    writeVertex(2u, b + 2u, packVertex(p + vec3<u32>(0u, 1u, 1u), 7u, 3u, block));
+    writeVertex(2u, b + 3u, packVertex(p + vec3<u32>(1u, 1u, 0u), 7u, 3u, block));
   }
 }
 
@@ -146,6 +214,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     var key = 0u;
     if (i < CHUNK_SIZE) {
       key = faceKey(dir, i32(s), i32(i), i32(t));
+      // +X workgroups also emit cross plants of their slice (cell x = s, y = i, z = t).
+      if (dir == 0u) {
+        let cell = vec3<u32>(s, i, t);
+        let block = sampleVoxel(vec3<i32>(cell));
+        if (blockRenderClass(block) == RC_CROSS) {
+          emitCross(slot, cell, block);
+        }
+      }
     }
     if (key != runKey) {
       if (runKey != 0u) {

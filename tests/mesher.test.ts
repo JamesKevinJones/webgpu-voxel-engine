@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BlockType, isFaceVisible } from '../src/world/block';
+import { BLOCK_TYPE_COUNT, BlockType, isFaceVisible } from '../src/world/block';
 import { CHUNK_SIZE, SELF_NEIGHBOR_INDEX, neighborIndex } from '../src/world/coords';
 import {
   FACE_NORMALS,
@@ -27,7 +27,7 @@ function volume(fill: (x: number, y: number, z: number) => number): Uint8Array {
 
 function quads(result: MeshResult): UnpackedVertex[][] {
   const out: UnpackedVertex[][] = [];
-  for (const list of [result.opaque, result.water]) {
+  for (const list of [result.opaque, result.water, result.cutout]) {
     for (let q = 0; q < list.length / 4; q++) {
       out.push([0, 1, 2, 3].map((k) => unpackVertex(list[q * 4 + k]!, { x: 0, y: 0, z: 0, face: 0, ao: 0, block: 0 })));
     }
@@ -68,6 +68,7 @@ function checkMeshInvariants(padded: Uint8Array, result: MeshResult): void {
   let area = 0;
   for (const q of quads(result)) {
     const face = q[0]!.face;
+    if (face >= 6) continue; // cross-plant quads are checked separately
     const [nx, ny, nz] = FACE_NORMALS[face]!;
     for (const v of q) {
       if (v.face !== face || v.block !== q[0]!.block) problems.push('inconsistent quad');
@@ -177,6 +178,57 @@ describe('greedy mesher', () => {
     expect(r.opaqueQuads).toBe(6);
   });
 
+  it('meshes glass into the cutout pool, merging glass panes and culling faces between them', () => {
+    const padded = volume((x, y, z) => (y === 5 && z === 5 && x >= 3 && x < 6 ? BlockType.Glass : BlockType.Air));
+    const r = greedyMesh(padded);
+    checkMeshInvariants(padded, r);
+    expect(r.opaqueQuads).toBe(0);
+    expect(r.cutoutQuads).toBe(6); // a 3×1×1 bar: no faces between glass blocks
+    expect(quads({ ...r, opaque: new Uint32Array(), water: new Uint32Array() }).every((q) => q[0]!.block === BlockType.Glass)).toBe(true);
+  });
+
+  it('draws opaque faces behind glass and plants (they do not occlude)', () => {
+    const padded = volume((x, y, z) => {
+      if (y === 0 && x >= 0 && z >= 0 && x < 32 && z < 32) return BlockType.Grass;
+      if (y === 1 && x === 4 && z === 4) return BlockType.Glass;
+      if (y === 1 && x === 8 && z === 8) return BlockType.TallGrass;
+      return BlockType.Air;
+    });
+    const r = greedyMesh(padded);
+    checkMeshInvariants(padded, r);
+    // The grass top under the glass block and under the plant is still emitted (area check),
+    // and neither affects ambient occlusion of the ground.
+    const tops = quads(r).filter((q) => q[0]!.block === BlockType.Grass && q[0]!.face === 2);
+    expect(tops.every((q) => q.every((v) => v.ao === 3))).toBe(true);
+  });
+
+  it('emits two crossed double quads per plant', () => {
+    const padded = volume((x, y, z) => (x === 2 && y === 3 && z === 4 ? BlockType.RedFlower : BlockType.Air));
+    const r = greedyMesh(padded);
+    expect(r.opaqueQuads + r.waterQuads).toBe(0);
+    expect(r.cutoutQuads).toBe(2);
+    const [a, b] = quads(r);
+    expect(a!.map((v) => v.face)).toEqual([6, 6, 6, 6]);
+    expect(b!.map((v) => v.face)).toEqual([7, 7, 7, 7]);
+    for (const q of [a!, b!]) {
+      for (const v of q) {
+        expect(v.block).toBe(BlockType.RedFlower);
+        expect([2, 3]).toContain(v.x);
+        expect([3, 4]).toContain(v.y);
+        expect([4, 5]).toContain(v.z);
+      }
+    }
+    // Diagonals: quad A spans x = z (+2 offset), quad B spans x + z = const.
+    expect(a!.every((v) => v.x - v.z === -2)).toBe(true);
+    expect(b!.every((v) => v.x + v.z === 7)).toBe(true);
+  });
+
+  it('keeps water faces against plants visible', () => {
+    const padded = volume((x, y, z) => (x === 5 && y === 5 && z === 5 ? BlockType.Water : x === 5 && y === 6 && z === 5 ? BlockType.TallGrass : BlockType.Air));
+    const r = greedyMesh(padded);
+    expect(r.waterQuads).toBe(6);
+  });
+
   it('respects neighbour chunks through the padded border', () => {
     const solid = new PalettedChunk(BlockType.Stone);
     const neighbors: (PalettedChunk | null)[] = new Array(27).fill(null);
@@ -196,7 +248,7 @@ describe('greedy mesher', () => {
     const rand = mulberry32(2024);
     for (let trial = 0; trial < 4; trial++) {
       const density = 0.2 + trial * 0.2;
-      const padded = volume(() => (rand() < density ? 1 + Math.floor(rand() * 6) : BlockType.Air));
+      const padded = volume(() => (rand() < density ? 1 + Math.floor(rand() * (BLOCK_TYPE_COUNT - 1)) : BlockType.Air));
       checkMeshInvariants(padded, greedyMesh(padded));
     }
   });

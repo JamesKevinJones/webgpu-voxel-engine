@@ -24,8 +24,8 @@ describe('bit widths', () => {
       expect(32 % bits).toBe(0);
       expect(dataWordsForBits(bits)).toBe((CHUNK_VOLUME * bits) / 32);
     }
-    expect(GPU_DATA_WORDS).toBe(4096);
-    expect(GPU_SLOT_WORDS).toBe(4 + MAX_GPU_PALETTE + 4096);
+    expect(GPU_DATA_WORDS).toBe(8192);
+    expect(GPU_SLOT_WORDS).toBe(4 + MAX_GPU_PALETTE + 8192);
   });
 });
 
@@ -83,7 +83,7 @@ describe('PalettedChunk', () => {
     const c = new PalettedChunk();
     for (let n = 0; n < 20_000; n++) c.set(Math.floor(rand() * CHUNK_VOLUME), Math.floor(rand() * BLOCK_TYPE_COUNT));
     expect(c.paletteEntries.length).toBeLessThanOrEqual(BLOCK_TYPE_COUNT);
-    expect(c.bits).toBeLessThanOrEqual(4);
+    expect(c.bits).toBeLessThanOrEqual(8);
   });
 
   it('compacts to the minimal width after blocks disappear', () => {
@@ -172,20 +172,20 @@ describe('GPU slot layout', () => {
     }
   });
 
-  it('decodes the 4-bit identity-palette layout written by worldgen.wgsl', () => {
+  it('decodes the 8-bit identity-palette layout written by worldgen.wgsl', () => {
     const dense = generateChunkDense(0, 0, 0, 1337);
     const words = new Uint32Array(GPU_SLOT_WORDS);
-    words[0] = 4;
-    words[1] = 16;
-    for (let p = 0; p < 16; p++) words[GPU_PALETTE_OFFSET + p] = p;
+    words[0] = 8;
+    words[1] = MAX_GPU_PALETTE;
+    for (let p = 0; p < MAX_GPU_PALETTE; p++) words[GPU_PALETTE_OFFSET + p] = p;
     for (let w = 0; w < GPU_DATA_WORDS; w++) {
       let packed = 0;
-      for (let k = 0; k < 8; k++) packed |= dense[w * 8 + k]! << (k * 4);
+      for (let k = 0; k < 4; k++) packed |= dense[w * 4 + k]! << (k * 8);
       words[GPU_DATA_OFFSET + w] = packed >>> 0;
     }
     const chunk = PalettedChunk.fromGpuLayout(words);
     expect(chunk.toDense()).toEqual(dense);
-    expect(chunk.bits).toBeLessThanOrEqual(4);
+    expect(chunk.bits).toBeLessThanOrEqual(8);
   });
 
   it('rejects corrupt GPU layouts', () => {
@@ -201,9 +201,9 @@ describe('GPU slot layout', () => {
 
   it('compacts before serialising palettes that exceed the GPU limit', () => {
     const c = new PalettedChunk();
-    // 20 distinct ids at some point, but only 2 survive.
-    for (let i = 0; i < 20; i++) c.set(i, 100 + i);
-    for (let i = 1; i < 20; i++) c.set(i, BlockType.Air);
+    // 40 distinct ids at some point, but only 2 survive.
+    for (let i = 0; i < 40; i++) c.set(i, 100 + i);
+    for (let i = 1; i < 40; i++) c.set(i, BlockType.Air);
     expect(c.paletteEntries.length).toBeGreaterThan(MAX_GPU_PALETTE);
     const words = new Uint32Array(GPU_SLOT_WORDS);
     c.writeGpuLayout(words);

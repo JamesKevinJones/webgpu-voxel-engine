@@ -35,6 +35,7 @@ export interface ChunkRecord {
   /** Quad counts reported by the GPU for the latest mesh (-1 = not yet known). */
   opaqueQuads: number;
   waterQuads: number;
+  cutoutQuads: number;
   /** CPU voxel data changed and must be re-uploaded to the GPU slot. */
   uploadPending: boolean;
 }
@@ -276,6 +277,7 @@ export class ChunkManager {
       record.hasMesh = true;
       record.opaqueQuads = -1;
       record.waterQuads = -1;
+      record.cutoutQuads = -1;
       jobs.push({ record, version: record.meshVersion, meshSlot: record.meshSlot, neighborSlots: this.neighborSlots(record) });
     }
     return jobs;
@@ -304,14 +306,15 @@ export class ChunkManager {
    * Records the GPU-reported quad counts of a mesh job. Chunks that produced no geometry
    * give their mesh slot back. Returns false for stale results.
    */
-  completeMesh(job: MeshJob, opaqueQuads: number, waterQuads: number): boolean {
+  completeMesh(job: MeshJob, opaqueQuads: number, waterQuads: number, cutoutQuads = 0): boolean {
     const record = job.record;
     if (this.chunks.get(record.key) !== record || record.meshVersion !== job.version || record.meshSlot !== job.meshSlot) {
       return false;
     }
     record.opaqueQuads = opaqueQuads;
     record.waterQuads = waterQuads;
-    if (opaqueQuads === 0 && waterQuads === 0) {
+    record.cutoutQuads = cutoutQuads;
+    if (opaqueQuads === 0 && waterQuads === 0 && cutoutQuads === 0) {
       this.meshSlots.free(record.meshSlot);
       record.meshSlot = -1;
       record.hasMesh = false;
@@ -405,6 +408,7 @@ function createRecord(key: number, cx: number, cy: number, cz: number): ChunkRec
     genToken: 0,
     opaqueQuads: -1,
     waterQuads: -1,
+    cutoutQuads: -1,
     uploadPending: false,
   };
 }

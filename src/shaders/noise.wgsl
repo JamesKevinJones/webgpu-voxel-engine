@@ -24,6 +24,7 @@ fn grad2(hash: u32, x: f32, y: f32) -> f32 {
   return select(-u, u, (h & 1u) == 0u) + select(-2.0 * v, 2.0 * v, (h & 2u) == 0u);
 }
 
+const RIDGE_SOFTNESS: f32 = 0.1;
 const NOISE_F2: f32 = 0.3660254037844386;
 const NOISE_G2: f32 = 0.21132486540518713;
 const NOISE_F3: f32 = 0.3333333333333333;
@@ -129,13 +130,15 @@ fn fbm2(x: f32, y: f32, octaves: u32, seed: u32) -> f32 {
   return sum / norm;
 }
 
+// Ridged multifractal with rounded crests (mirrors ridged2 in src/world/noise.ts).
 fn ridged2(x: f32, y: f32, octaves: u32, seed: u32) -> f32 {
   var sum = 0.0;
   var amp = 1.0;
   var freq = 1.0;
   var norm = 0.0;
   for (var o = 0u; o < octaves; o++) {
-    let r = 1.0 - abs(simplex2(x * freq, y * freq, seed + o));
+    let n = simplex2(x * freq, y * freq, seed + o);
+    let r = max(0.0, 1.0 - sqrt(n * n + RIDGE_SOFTNESS * RIDGE_SOFTNESS));
     sum += amp * r * r;
     norm += amp;
     amp *= 0.5;

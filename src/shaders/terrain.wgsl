@@ -29,7 +29,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
   let local = vec3<f32>(f32(packed & 63u), f32((packed >> 6u) & 63u), f32((packed >> 12u) & 63u));
   let face = (packed >> 18u) & 7u;
   let ao = (packed >> 21u) & 3u;
-  let block = (packed >> 23u) & 15u;
+  let block = (packed >> 23u) & 31u;
   var world = origin + local;
   if (block == BLOCK_WATER && face == 2u) {
     world.y -= 0.12; // water surface sits slightly below the block top

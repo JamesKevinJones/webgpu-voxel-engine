@@ -3,17 +3,17 @@ import { CHUNK_VOLUME, localIndex } from './coords';
 
 /**
  * GPU voxel slot layout (u32 words), shared with `gather.wgsl` / `worldgen.wgsl`:
- *   [0] bits per palette index (0, 1, 2 or 4)
+ *   [0] bits per palette index (0, 1, 2, 4 or 8)
  *   [1] palette length
  *   [2] non-air voxel count (informational)
  *   [3] reserved
- *   [4 .. 4+16) palette → block ids
- *   [20 .. 20+4096) packed palette indices, LSB-first, x fastest
+ *   [4 .. 4+32) palette → block ids
+ *   [36 .. 36+8192) packed palette indices, LSB-first, x fastest
  */
 export const GPU_HEADER_WORDS = 4;
 export const GPU_PALETTE_OFFSET = GPU_HEADER_WORDS;
 export const GPU_DATA_OFFSET = GPU_PALETTE_OFFSET + MAX_GPU_PALETTE;
-export const GPU_MAX_BITS = 4;
+export const GPU_MAX_BITS = 8;
 export const GPU_DATA_WORDS = (CHUNK_VOLUME * GPU_MAX_BITS) / 32;
 export const GPU_SLOT_WORDS = GPU_DATA_OFFSET + GPU_DATA_WORDS;
 
@@ -216,11 +216,12 @@ export class PalettedChunk {
 
   /**
    * Serialises into the GPU slot layout. Compacts first if the palette is too large for the
-   * 4-bit GPU encoding. Returns the number of words written.
+   * 8-bit GPU encoding. Returns the number of words written.
    */
   writeGpuLayout(out: Uint32Array, offset = 0): number {
-    if (this.bitsValue > GPU_MAX_BITS) this.compact();
-    if (this.bitsValue > GPU_MAX_BITS) {
+    const fits = (): boolean => this.bitsValue <= GPU_MAX_BITS && this.palette.length <= MAX_GPU_PALETTE;
+    if (!fits()) this.compact();
+    if (!fits()) {
       throw new RangeError(`chunk palette (${this.palette.length} entries) exceeds GPU limit of ${MAX_GPU_PALETTE}`);
     }
     out[offset] = this.bitsValue;
@@ -238,7 +239,7 @@ export class PalettedChunk {
   static fromGpuLayout(words: Uint32Array, offset = 0): PalettedChunk {
     const bits = words[offset]!;
     const paletteLength = words[offset + 1]!;
-    if (!(bits === 0 || bits === 1 || bits === 2 || bits === 4)) throw new RangeError(`invalid GPU bits ${bits}`);
+    if (!(bits === 0 || bits === 1 || bits === 2 || bits === 4 || bits === 8)) throw new RangeError(`invalid GPU bits ${bits}`);
     if (paletteLength < 1 || paletteLength > MAX_GPU_PALETTE) throw new RangeError(`invalid palette length ${paletteLength}`);
     const palette = words.subarray(offset + GPU_PALETTE_OFFSET, offset + GPU_PALETTE_OFFSET + MAX_GPU_PALETTE);
     const dense = new Uint16Array(CHUNK_VOLUME);

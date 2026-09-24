@@ -1,4 +1,4 @@
-import { BlockType, isFaceVisible, isOpaque } from './block';
+import { BlockType, isCrossPlant, isFaceVisible, isOpaque, renderClass } from './block';
 import { CHUNK_SIZE, SELF_NEIGHBOR_INDEX, resolveNeighbor, neighborIndex, type NeighborLocation } from './coords';
 import {
   FACE_COUNT,
@@ -44,11 +44,16 @@ export function paddedFromSingleChunk(chunk: VoxelSource): Uint8Array {
 export interface MeshResult {
   opaque: Uint32Array;
   water: Uint32Array;
+  /** Alpha-tested geometry: glass faces and cross-plant quads. */
+  cutout: Uint32Array;
   opaqueQuads: number;
   waterQuads: number;
+  cutoutQuads: number;
 }
 
-const AO_OPEN_KEY = 0xff << 4;
+/** Face key layout: block id in bits 0..4, four 2-bit corner AO levels in bits 5..12. */
+const KEY_AO_SHIFT = 5;
+const AO_OPEN_KEY = 0xff << KEY_AO_SHIFT;
 
 /**
  * CPU reference implementation of the GPU greedy mesher (`mesh.wgsl`), same algorithm:
@@ -60,6 +65,8 @@ const AO_OPEN_KEY = 0xff << 4;
 export function greedyMesh(padded: Uint8Array): MeshResult {
   const opaque: number[] = [];
   const water: number[] = [];
+  const cutout: number[] = [];
+  const pools = { opaque, water, cutout };
   const runs = new Uint32Array(CHUNK_SIZE * CHUNK_SIZE);
   const p = [0, 0, 0];
   const q = [0, 0, 0];
@@ -86,7 +93,7 @@ export function greedyMesh(padded: Uint8Array): MeshResult {
             q[a] = q[a]! + sign;
             const neighbor = sample(q[0]!, q[1]!, q[2]!);
             if (isFaceVisible(block, neighbor)) {
-              key = block | (isOpaque(block) ? aoKey(q, u, v, occ) : AO_OPEN_KEY);
+              key = block | (block === BlockType.Water ? AO_OPEN_KEY : aoKey(q, u, v, occ));
             }
           }
           if (key !== runKey) {
@@ -103,19 +110,40 @@ export function greedyMesh(padded: Uint8Array): MeshResult {
         for (let j = 0; j <= CHUNK_SIZE; j++) {
           const r = j < CHUNK_SIZE ? runs[j * CHUNK_SIZE + i]! : 0;
           if (open !== 0 && r === open) continue;
-          if (open !== 0) emitQuad(dir, s, i, startJ, open >>> 16, j - startJ, open & 0xffff, opaque, water);
+          if (open !== 0) emitQuad(dir, s, i, startJ, open >>> 16, j - startJ, open & 0xffff, pools);
           open = r;
           startJ = j;
         }
       }
     }
   }
+  // Cross plants: two diagonal quads per voxel (drawn double-sided with alpha testing).
+  for (let z = 0; z < CHUNK_SIZE; z++) {
+    for (let y = 0; y < CHUNK_SIZE; y++) {
+      for (let x = 0; x < CHUNK_SIZE; x++) {
+        const block = sample(x, y, z);
+        if (isCrossPlant(block)) emitCross(x, y, z, block, cutout);
+      }
+    }
+  }
   return {
     opaque: Uint32Array.from(opaque),
     water: Uint32Array.from(water),
+    cutout: Uint32Array.from(cutout),
     opaqueQuads: opaque.length / 4,
     waterQuads: water.length / 4,
+    cutoutQuads: cutout.length / 4,
   };
+}
+
+/** Emits the two crossed quads of a plant at (x, y, z): faces 6 (x = z plane) and 7 (x = 1 - z). */
+export function emitCross(x: number, y: number, z: number, block: number, out: number[]): void {
+  out.push(
+    packVertex(x, y, z, 6, 3, block), packVertex(x + 1, y, z + 1, 6, 3, block),
+    packVertex(x + 1, y + 1, z + 1, 6, 3, block), packVertex(x, y + 1, z, 6, 3, block),
+    packVertex(x + 1, y, z, 7, 3, block), packVertex(x, y, z + 1, 7, 3, block),
+    packVertex(x, y + 1, z + 1, 7, 3, block), packVertex(x + 1, y + 1, z, 7, 3, block),
+  );
 }
 
 /** Corner AO for the face whose outside cell is q. Corner order: (0,0) (1,0) (1,1) (0,1) in (u,v). */
@@ -134,7 +162,7 @@ function aoKey(q: number[], u: number, v: number, occ: (x: number, y: number, z:
     c[u] = c[u]! + du;
     const cornerOcc = occ(c[0]!, c[1]!, c[2]!);
     const ao = side1 && side2 ? 0 : 3 - (side1 + side2 + cornerOcc);
-    key |= ao << (4 + corner * 2);
+    key |= ao << (KEY_AO_SHIFT + corner * 2);
   }
   return key;
 }
@@ -147,21 +175,21 @@ function emitQuad(
   w: number,
   h: number,
   key: number,
-  opaque: number[],
-  water: number[],
+  pools: { opaque: number[]; water: number[]; cutout: number[] },
 ): void {
   const a = dir >> 1;
   const u = (a + 1) % 3;
   const v = (a + 2) % 3;
   const negative = (dir & 1) === 1;
-  const block = key & 15;
-  const ao = [(key >> 4) & 3, (key >> 6) & 3, (key >> 8) & 3, (key >> 10) & 3];
+  const block = key & 31;
+  const ao = [0, 1, 2, 3].map((c) => (key >> (KEY_AO_SHIFT + c * 2)) & 3);
   const plane = negative ? s : s + 1;
   // Corner indices into the (u,v) corner table (0,0) (1,0) (1,1) (0,1).
   const order = negative ? [0, 3, 2, 1] : [0, 1, 2, 3];
   // Flip the shared diagonal when the other one is brighter (removes AO interpolation anisotropy).
   const flip = ao[0]! + ao[2]! < ao[1]! + ao[3]!;
-  const out = block === BlockType.Water ? water : opaque;
+  const cls = renderClass(block);
+  const out = cls === 'water' ? pools.water : cls === 'cutout' ? pools.cutout : pools.opaque;
   const pos = [0, 0, 0];
   for (let k = 0; k < 4; k++) {
     const corner = order[(k + (flip ? 1 : 0)) & 3]!;

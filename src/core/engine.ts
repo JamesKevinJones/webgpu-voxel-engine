@@ -269,7 +269,7 @@ export class Engine {
     return this.meshStaging.read(buffer, jobs.length * MESH_COUNTER_WORDS * 4, (bytes) => {
       const counts = new Uint32Array(bytes);
       jobs.forEach((job, i) => {
-        this.chunks.completeMesh(job, counts[i * MESH_COUNTER_WORDS]!, counts[i * MESH_COUNTER_WORDS + 1]!);
+        this.chunks.completeMesh(job, counts[i * MESH_COUNTER_WORDS]!, counts[i * MESH_COUNTER_WORDS + 1]!, counts[i * MESH_COUNTER_WORDS + 2]!);
       });
     });
   }

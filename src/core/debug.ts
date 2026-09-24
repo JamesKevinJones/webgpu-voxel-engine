@@ -11,7 +11,7 @@ export interface ParityReport {
   voxelsCompared: number;
   voxelMismatches: number;
   meshesCompared: number;
-  meshMismatches: { chunk: [number, number, number]; gpu: [number, number]; cpu: [number, number] }[];
+  meshMismatches: { chunk: [number, number, number]; gpu: [number, number, number]; cpu: [number, number, number] }[];
 }
 
 export interface VoxelDebugApi {
@@ -65,11 +65,11 @@ export function runParityCheck(engine: Engine, maxChunks = 32): ParityReport {
     }
     const cpu = greedyMesh(buildPaddedVolume(neighbors));
     report.meshesCompared++;
-    if (cpu.opaqueQuads !== record.opaqueQuads || cpu.waterQuads !== record.waterQuads) {
+    if (cpu.opaqueQuads !== record.opaqueQuads || cpu.waterQuads !== record.waterQuads || cpu.cutoutQuads !== record.cutoutQuads) {
       report.meshMismatches.push({
         chunk: [record.cx, record.cy, record.cz],
-        gpu: [record.opaqueQuads, record.waterQuads],
-        cpu: [cpu.opaqueQuads, cpu.waterQuads],
+        gpu: [record.opaqueQuads, record.waterQuads, record.cutoutQuads],
+        cpu: [cpu.opaqueQuads, cpu.waterQuads, cpu.cutoutQuads],
       });
     }
   }

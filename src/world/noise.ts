@@ -114,11 +114,15 @@ export function fbm2(x: number, y: number, octaves: number, seed: number): numbe
   return sum / norm;
 }
 
-/** Ridged multifractal (sharp crests where the noise crosses zero), in [0, 1]. */
+/** Softness of ridge crests: |n| is replaced by sqrt(n² + ε²) so crests are rounded, not cusps. */
+export const RIDGE_SOFTNESS = 0.1;
+
+/** Ridged multifractal (rounded crests where the noise crosses zero), in [0, 1]. */
 export function ridged2(x: number, y: number, octaves: number, seed: number): number {
   let sum = 0, amp = 1, freq = 1, norm = 0;
   for (let o = 0; o < octaves; o++) {
-    const r = 1 - Math.abs(simplex2(x * freq, y * freq, (seed + o) >>> 0));
+    const n = simplex2(x * freq, y * freq, (seed + o) >>> 0);
+    const r = Math.max(0, 1 - Math.sqrt(n * n + RIDGE_SOFTNESS * RIDGE_SOFTNESS));
     sum += amp * r * r;
     norm += amp;
     amp *= 0.5;
