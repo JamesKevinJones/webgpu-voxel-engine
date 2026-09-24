@@ -1,12 +1,14 @@
 import { Camera } from '../camera/camera';
 import { FlyController, readMoveIntent, type MoveIntent } from '../camera/fly-controller';
 import { InputState } from '../camera/input';
-import { Renderer, type DrawLists } from '../gpu/renderer';
+import { MiningState } from '../fx/mining';
+import { ParticleRing } from '../fx/particles';
+import { Renderer, SHADOW_CASCADES, SHADOW_MAP_SIZE, type DrawLists } from '../gpu/renderer';
 import { StagingPool } from '../gpu/staging-pool';
 import { VOXEL_SLOT_BYTES, WorldGpu, fitSlotsToLimits } from '../gpu/world-gpu';
 import { intersectsSolid, type SolidQuery } from '../physics/aabb';
 import { Player, type PlayerWorld } from '../physics/player';
-import { BLOCK_NAMES, BlockType, isOpaque, isUnbreakable } from '../world/block';
+import { BLOCK_NAMES, BlockType, isSolid, isTargetable } from '../world/block';
 import { ChunkManager, DEFAULT_STREAMING, type GenerationJob, type MeshJob } from '../world/chunk-manager';
 import { CHUNK_SIZE, worldToChunk } from '../world/coords';
 import {
@@ -14,10 +16,13 @@ import {
   OPAQUE_QUAD_CAPACITY,
   VERTICES_PER_QUAD,
   WATER_QUAD_CAPACITY,
+  CUTOUT_QUAD_CAPACITY,
 } from '../world/mesh-format';
 import { GPU_SLOT_WORDS, PalettedChunk } from '../world/palette-chunk';
 import { raycastVoxels, type RaycastHit } from '../world/raycast';
-import { SEA_LEVEL, surfaceHeight } from '../world/terrain';
+import { SEA_LEVEL, climateAt, surfaceHeight, BIOME_NAMES } from '../world/terrain';
+import { computeCascades } from './cascades';
+import { HotbarModel } from './hotbar';
 import { FrameTimer } from './frame-timer';
 import { computeSky, formatTimeOfDay, wrapTime } from './sky';
 import { GpuContext } from './gpu-context';
@@ -52,11 +57,12 @@ export const DEFAULT_ENGINE_OPTIONS: EngineOptions = {
   dayLength: 600,
 };
 
-const PLACEABLE = [
-  BlockType.Stone, BlockType.Dirt, BlockType.Grass, BlockType.Sand, BlockType.Water,
-  BlockType.Basalt, BlockType.Wood, BlockType.Leaves,
-];
 const REACH = 8;
+/** Shadows are rendered up to this view depth (clamped to the fog distance). */
+const SHADOW_DISTANCE = 160;
+const SHADOW_SPLIT_LAMBDA = 0.75;
+/** Extra depth towards the light so off-screen occluders (mountains, trees) still cast shadows. */
+const SHADOW_CASTER_MARGIN = 120;
 /** CPU may run at most this many frames ahead of the GPU (backpressure for slow or offscreen GPUs). */
 const MAX_FRAMES_IN_FLIGHT = 2;
 
@@ -81,12 +87,24 @@ export class Engine {
   private raf = 0;
   private running = false;
   private framesInFlight = 0;
+  /** Frames whose GPU work has completed (automation waits on this for fresh captures). */
+  completedFrames = 0;
   private startTime = -1;
-  private placeIndex = 0;
+  readonly hotbar = new HotbarModel();
+  readonly mining = new MiningState();
+  readonly particles = new ParticleRing();
+  private crackStage = -1;
+  /** Blocks broken so far and the size of the most recent debris burst. */
+  blocksBroken = 0;
+  lastBurstSize = 0;
+  shadowsEnabled = true;
   private readonly moveIntent: MoveIntent = { forward: 0, strafe: 0, vertical: 0, boost: false };
   private target: RaycastHit | null = null;
   private visibleChunks = 0;
-  private readonly draws: { opaque: number[]; water: number[] } = { opaque: [], water: [] };
+  private readonly draws: { opaque: number[]; cutout: number[]; water: number[]; shadow: number[][] } = {
+    opaque: [], cutout: [], water: [], shadow: Array.from({ length: SHADOW_CASCADES }, () => []),
+  };
+  private cascadeSpheres: { center: [number, number, number]; radius: number }[] = [];
   private readonly sortScratch: { slot: number; d: number }[] = [];
   private readonly waterScratch: { slot: number; d: number }[] = [];
   /** Pending asynchronous readbacks (awaited by `flush`). */
@@ -111,7 +129,7 @@ export class Engine {
     // Unloaded chunks count as solid so the player can never fall out of the generated world.
     const solid: SolidQuery = (x, y, z) => {
       const b = this.chunks.getBlock(x, y, z);
-      return b < 0 || isOpaque(b);
+      return b < 0 || isSolid(b);
     };
     this.playerWorld = { solid, water: (x, y, z) => this.chunks.getBlock(x, y, z) === BlockType.Water };
     this.genStaging = new StagingPool(gpu.device, options.generationBatch * VOXEL_SLOT_BYTES, 3, 'worldgen readback');
@@ -126,6 +144,7 @@ export class Engine {
     const fogEnd = options.radius * CHUNK_SIZE - 8;
     this.camera.far = Math.max(600, fogEnd * 1.6);
     uniforms.setFog(fogEnd, 0.8 / fogEnd, 0.02, SEA_LEVEL);
+    uniforms.setSeed(options.seed);
   }
 
   static async create(canvas: HTMLCanvasElement, overlayRoot: HTMLElement | null, options: Partial<EngineOptions> = {}): Promise<Engine> {
@@ -171,7 +190,7 @@ export class Engine {
   }
 
   get placeBlock(): number {
-    return PLACEABLE[this.placeIndex]!;
+    return this.hotbar.block;
   }
 
   private readonly frame = (now: number): void => {
@@ -196,13 +215,20 @@ export class Engine {
 
     this.handleHotkeys();
     this.controller.look();
-    if (this.mode === 'walk') this.updatePlayer(dt);
-    else this.controller.move(dt);
+    if (this.mode === 'walk') {
+      this.hotbar.scroll(Math.sign(this.input.consumeWheel()));
+      this.updatePlayer(dt);
+    } else {
+      this.controller.move(dt);
+    }
     if (!this.timePaused && this.options.dayLength > 0) this.timeOfDay = wrapTime(this.timeOfDay + dt / this.options.dayLength);
-    this.uniforms.setSky(computeSky(this.timeOfDay));
+    const sky = computeSky(this.timeOfDay);
+    this.uniforms.setSky(sky);
     this.camera.updateMatrices();
     this.updateTarget();
     this.handleClicks();
+    this.updateMining(dt);
+    this.updateShadows(sky.lightDir, sky.lightIntensity);
 
     const pos = this.camera.position;
     this.chunks.updateCenter(worldToChunk(pos[0]!), worldToChunk(pos[1]!), worldToChunk(pos[2]!));
@@ -229,16 +255,21 @@ export class Engine {
     this.world.encodeMeshing(encoder, meshJobs, meshBuffer);
 
     this.buildDrawLists();
-    this.uniforms.setCamera(this.camera.viewProjection, this.camera.inverseViewProjection, pos, (now - this.startTime) / 1000,
-      this.camera.near, this.camera.far);
+    this.uniforms.setCamera(this.camera.viewProjection, this.camera.inverseViewProjection, pos, this.camera.forward,
+      (now - this.startTime) / 1000, this.camera.near, this.camera.far);
     this.uniforms.upload();
+    this.renderer.simulateParticles(encoder, dt);
     const colorView = this.gpu.currentColorView();
-    this.renderer.render(encoder, colorView, this.gpu.depthView!, this.draws as DrawLists);
+    const t = this.target;
+    this.renderer.render(encoder, colorView, this.gpu.depthView!, this.draws as DrawLists, {
+      target: t ? [t.x, t.y, t.z] : null,
+      crackStage: this.crackStage,
+    });
 
     device.queue.submit([encoder.finish()]);
     this.framesInFlight++;
     device.queue.onSubmittedWorkDone().then(
-      () => { this.framesInFlight--; },
+      () => { this.framesInFlight--; this.completedFrames++; },
       () => { this.framesInFlight--; },
     );
 
@@ -279,18 +310,29 @@ export class Engine {
     const water = this.waterScratch;
     opaque.length = 0;
     water.length = 0;
+    this.draws.cutout.length = 0;
+    for (const list of this.draws.shadow) list.length = 0;
     const frustum = this.camera.frustum;
     const p = this.camera.position;
+    const h = CHUNK_SIZE / 2;
+    const chunkRadius = h * Math.sqrt(3);
     let visible = 0;
     for (const r of this.chunks.drawable()) {
       const x0 = r.cx * CHUNK_SIZE, y0 = r.cy * CHUNK_SIZE, z0 = r.cz * CHUNK_SIZE;
+      // Shadow casters: any chunk whose bounding sphere touches a cascade's light volume.
+      if (r.opaqueQuads !== 0) {
+        this.cascadeSpheres.forEach((c, i) => {
+          const d = Math.hypot(x0 + h - c.center[0], y0 + h - c.center[1], z0 + h - c.center[2]);
+          if (d <= c.radius + chunkRadius) this.draws.shadow[i]!.push(r.meshSlot);
+        });
+      }
       if (!frustum.intersectsAabb(x0, y0, z0, x0 + CHUNK_SIZE, y0 + CHUNK_SIZE, z0 + CHUNK_SIZE)) continue;
       visible++;
-      const h = CHUNK_SIZE / 2;
       const dx = x0 + h - p[0]!, dy = y0 + h - p[1]!, dz = z0 + h - p[2]!;
       const d = dx * dx + dy * dy + dz * dz;
       if (r.opaqueQuads !== 0) opaque.push({ slot: r.meshSlot, d });
       if (r.waterQuads !== 0) water.push({ slot: r.meshSlot, d });
+      if (r.cutoutQuads !== 0) this.draws.cutout.push(r.meshSlot);
     }
     opaque.sort((a, b) => a.d - b.d);
     water.sort((a, b) => b.d - a.d);
@@ -301,19 +343,73 @@ export class Engine {
     this.visibleChunks = visible;
   }
 
+  /** Fits the shadow cascades to the camera for the current key light. */
+  private updateShadows(lightDir: readonly number[], intensity: number): void {
+    const cam = this.camera;
+    if (!this.shadowsEnabled || intensity <= 0.01 || lightDir[1]! < 0.03) {
+      this.cascadeSpheres = [];
+      this.uniforms.setShadows(null);
+      return;
+    }
+    const f = cam.forward, r = cam.right;
+    const up = [r[1]! * f[2]! - r[2]! * f[1]!, r[2]! * f[0]! - r[0]! * f[2]!, r[0]! * f[1]! - r[1]! * f[0]!];
+    const distance = Math.min(SHADOW_DISTANCE, this.options.radius * CHUNK_SIZE);
+    const cascades = computeCascades(
+      { position: cam.position, forward: f, right: r, up, fovY: cam.fovY, aspect: cam.aspect },
+      lightDir, cam.near, distance, SHADOW_CASCADES, SHADOW_SPLIT_LAMBDA, SHADOW_MAP_SIZE, SHADOW_CASTER_MARGIN,
+    );
+    // Casters may sit anywhere along the light direction within the margin.
+    this.cascadeSpheres = cascades.map((c) => ({ center: c.center, radius: c.radius + SHADOW_CASTER_MARGIN }));
+    this.uniforms.setShadows({
+      viewProj: [cascades[0]!.viewProj, cascades[1]!.viewProj],
+      splitFar: [cascades[0]!.far, cascades[1]!.far],
+      texelSize: [cascades[0]!.texelSize, cascades[1]!.texelSize],
+      resolution: SHADOW_MAP_SIZE,
+      blend: 0.15,
+    });
+  }
+
+  /** Hold-to-mine: advances crack stages and breaks the block (with a debris burst) when done. */
+  private updateMining(dt: number): void {
+    const t = this.target;
+    const result = this.mining.update(dt, this.input.isButtonDown(0), t ? { x: t.x, y: t.y, z: t.z, block: t.block } : null);
+    this.crackStage = result.stage;
+    if (result.broken) this.breakBlock(result.broken.x, result.broken.y, result.broken.z);
+  }
+
+  /** Removes a block and emits 16–24 debris fragments that bounce on the floor below it. */
+  breakBlock(x: number, y: number, z: number): boolean {
+    const block = this.chunks.getBlock(x, y, z);
+    if (block <= 0 || !this.chunks.setBlock(x, y, z, BlockType.Air)) return false;
+    let floorY = y - 8;
+    for (let fy = y - 1; fy >= y - 8; fy--) {
+      const b = this.chunks.getBlock(x, fy, z);
+      if (b < 0 || isSolid(b)) {
+        floorY = fy + 1;
+        break;
+      }
+    }
+    const ranges = this.particles.spawnBurst(block, x, y, z, floorY);
+    this.renderer.uploadParticles(this.particles.data, ranges);
+    this.blocksBroken++;
+    this.lastBurstSize = ranges.reduce((n, r) => n + r.count, 0);
+    this.updateTarget();
+    return true;
+  }
+
   private updateTarget(): void {
     const p = this.camera.position, f = this.camera.forward;
     this.target = raycastVoxels(p[0]!, p[1]!, p[2]!, f[0]!, f[1]!, f[2]!, REACH,
-      (x, y, z) => this.chunks.getBlock(x, y, z), isOpaque);
+      (x, y, z) => this.chunks.getBlock(x, y, z), isTargetable);
   }
 
   private handleHotkeys(): void {
-    for (let i = 0; i < PLACEABLE.length; i++) {
-      if (this.input.isDown(`Digit${i + 1}`)) this.placeIndex = i;
-    }
     for (const code of this.input.consumePresses()) {
-      if (code === 'KeyV') this.setMode(this.mode === 'walk' ? 'freecam' : 'walk');
+      const slot = HotbarModel.slotForKey(code);
+      if (slot >= 0) this.hotbar.select(slot);
+      else if (code === 'KeyV') this.setMode(this.mode === 'walk' ? 'freecam' : 'walk');
       else if (code === 'KeyT') this.timePaused = !this.timePaused;
+      else if (code === 'KeyG') this.shadowsEnabled = !this.shadowsEnabled;
       else if (code === 'BracketRight') this.timeOfDay = wrapTime(this.timeOfDay + 1 / 24);
       else if (code === 'BracketLeft') this.timeOfDay = wrapTime(this.timeOfDay - 1 / 24);
     }
@@ -349,22 +445,20 @@ export class Engine {
     this.player.eye(this.camera.position);
   }
 
+  /** Right click places the selected hotbar block against the targeted face (left click mines, see updateMining). */
   private handleClicks(): void {
     for (const button of this.input.consumeClicks()) {
       const hit = this.target;
-      if (!hit) continue;
-      if (button === 0) {
-        if (!isUnbreakable(hit.block)) this.chunks.setBlock(hit.x, hit.y, hit.z, BlockType.Air);
-      } else if (button === 2) {
-        const x = hit.x + hit.nx, y = hit.y + hit.ny, z = hit.z + hit.nz;
-        const existing = this.chunks.getBlock(x, y, z);
-        // Never place a solid block inside the walking player.
-        const blocksPlayer = this.mode === 'walk' && isOpaque(this.placeBlock) &&
-          intersectsSolid(this.player.bounds(), (bx, by, bz) => bx === x && by === y && bz === z);
-        if ((existing === BlockType.Air || existing === BlockType.Water) && !blocksPlayer) {
-          this.chunks.setBlock(x, y, z, this.placeBlock);
-        }
-      }
+      if (!hit || button !== 2) continue;
+      const x = hit.x + hit.nx, y = hit.y + hit.ny, z = hit.z + hit.nz;
+      const existing = this.chunks.getBlock(x, y, z);
+      const block = this.placeBlock;
+      // Never place a solid block inside the walking player.
+      const blocksPlayer = this.mode === 'walk' && isSolid(block) &&
+        intersectsSolid(this.player.bounds(), (bx, by, bz) => bx === x && by === y && bz === z);
+      const replaceable = existing === BlockType.Air || existing === BlockType.Water ||
+        existing === BlockType.TallGrass || existing === BlockType.RedFlower || existing === BlockType.YellowFlower;
+      if (replaceable && !blocksPlayer) this.chunks.setBlock(x, y, z, block);
       this.updateTarget();
     }
   }
@@ -374,9 +468,9 @@ export class Engine {
     let meshed = 0, vertices = 0, overflow = 0, cpuBytes = 0;
     for (const r of this.chunks.drawable()) {
       meshed++;
-      const oq = Math.max(0, r.opaqueQuads), wq = Math.max(0, r.waterQuads);
-      if (oq > OPAQUE_QUAD_CAPACITY || wq > WATER_QUAD_CAPACITY) overflow++;
-      vertices += (Math.min(oq, OPAQUE_QUAD_CAPACITY) + Math.min(wq, WATER_QUAD_CAPACITY)) * VERTICES_PER_QUAD;
+      const oq = Math.max(0, r.opaqueQuads), wq = Math.max(0, r.waterQuads), cq = Math.max(0, r.cutoutQuads);
+      if (oq > OPAQUE_QUAD_CAPACITY || wq > WATER_QUAD_CAPACITY || cq > CUTOUT_QUAD_CAPACITY) overflow++;
+      vertices += (Math.min(oq, OPAQUE_QUAD_CAPACITY) + Math.min(wq, WATER_QUAD_CAPACITY) + Math.min(cq, CUTOUT_QUAD_CAPACITY)) * VERTICES_PER_QUAD;
     }
     for (const r of this.chunks.chunks.values()) if (r.data) cpuBytes += r.data.dataByteLength + 64;
     const p = this.camera.position, v = this.mode === 'walk' ? this.player.velocity : this.controller.velocity;
@@ -407,7 +501,11 @@ export class Engine {
         : this.player.inWater ? 'swimming' : this.player.grounded ? 'grounded' : 'airborne',
       timeOfDay: `${formatTimeOfDay(this.timeOfDay)}${this.timePaused ? ' (paused)' : ''}`,
       target: t ? `${BLOCK_NAMES[t.block]} @ ${t.x}, ${t.y}, ${t.z}` : '—',
-      placeBlock: `${this.placeIndex + 1}: ${BLOCK_NAMES[this.placeBlock]}`,
+      placeBlock: `${this.hotbar.selected + 1}: ${BLOCK_NAMES[this.placeBlock]}`,
+      biome: BIOME_NAMES[climateAt(Math.floor(p[0]!), Math.floor(p[2]!), this.options.seed).biome],
+      mining: this.crackStage >= 0 ? `${Math.round(this.mining.progress * 100)} % (stage ${this.crackStage})` : '—',
+      particles: this.particles.alive(),
+      shadows: this.cascadeSpheres.length > 0 ? `${SHADOW_CASCADES} cascades` : 'off',
       seed: this.options.seed,
     };
   }

@@ -7,23 +7,39 @@ import type { SkyState } from './sky';
 export const FRAME_LAYOUT = {
   viewProj: 0,
   invViewProj: 16,
-  cameraPos: 32,
-  lightDir: 36,
-  lightColor: 40,
-  sunDir: 44,
-  sunColor: 48,
-  skyZenith: 52,
-  skyHorizon: 56,
-  fog: 60,
-  viewport: 64,
-  clip: 68,
+  shadowViewProj0: 32,
+  shadowViewProj1: 48,
+  cameraPos: 64,
+  cameraDir: 68,
+  lightDir: 72,
+  lightColor: 76,
+  sunDir: 80,
+  sunColor: 84,
+  skyZenith: 88,
+  skyHorizon: 92,
+  fog: 96,
+  viewport: 100,
+  clip: 104,
+  shadowSplits: 108,
+  shadowParams: 112,
 } as const;
 
-export const FRAME_FLOATS = 72;
+export const FRAME_FLOATS = 116;
 export const FRAME_BYTES = FRAME_FLOATS * 4;
+
+export interface ShadowUniforms {
+  viewProj: [Float32Array, Float32Array];
+  /** View depth where cascade 0 ends and where shadows end. */
+  splitFar: [number, number];
+  texelSize: [number, number];
+  resolution: number;
+  /** Fraction of each cascade used to cross-fade into the next one. */
+  blend: number;
+}
 
 export class FrameUniforms {
   readonly data = new Float32Array(FRAME_FLOATS);
+  private readonly bits = new Uint32Array(this.data.buffer);
   readonly buffer: GPUBuffer;
 
   constructor(private readonly device: GPUDevice) {
@@ -34,11 +50,33 @@ export class FrameUniforms {
     });
   }
 
-  setCamera(viewProj: Float32Array, invViewProj: Float32Array, position: ArrayLike<number>, time: number, near: number, far: number): void {
+  setCamera(
+    viewProj: Float32Array, invViewProj: Float32Array, position: ArrayLike<number>, forward: ArrayLike<number>,
+    time: number, near: number, far: number,
+  ): void {
     this.data.set(viewProj, FRAME_LAYOUT.viewProj);
     this.data.set(invViewProj, FRAME_LAYOUT.invViewProj);
     this.setVec4(FRAME_LAYOUT.cameraPos, position[0]!, position[1]!, position[2]!, time);
+    this.data[FRAME_LAYOUT.cameraDir] = forward[0]!;
+    this.data[FRAME_LAYOUT.cameraDir + 1] = forward[1]!;
+    this.data[FRAME_LAYOUT.cameraDir + 2] = forward[2]!;
     this.setVec4(FRAME_LAYOUT.clip, near, far, 0, 0);
+  }
+
+  /** World seed (bit-cast into cameraDir.w) so shaders can evaluate the climate for biome tints. */
+  setSeed(seed: number): void {
+    this.bits[FRAME_LAYOUT.cameraDir + 3] = seed >>> 0;
+  }
+
+  setShadows(shadows: ShadowUniforms | null): void {
+    if (!shadows) {
+      this.setVec4(FRAME_LAYOUT.shadowParams, 0, 0, 0, 0);
+      return;
+    }
+    this.data.set(shadows.viewProj[0], FRAME_LAYOUT.shadowViewProj0);
+    this.data.set(shadows.viewProj[1], FRAME_LAYOUT.shadowViewProj1);
+    this.setVec4(FRAME_LAYOUT.shadowSplits, shadows.splitFar[0], shadows.splitFar[1], shadows.texelSize[0], shadows.texelSize[1]);
+    this.setVec4(FRAME_LAYOUT.shadowParams, 1, shadows.blend, 1 / shadows.resolution, 0);
   }
 
   /** Sun/moon lighting and sky gradient for the current time of day. */

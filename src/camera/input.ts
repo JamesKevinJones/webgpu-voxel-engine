@@ -10,6 +10,8 @@ export class InputState {
   private wheel = 0;
   private clicks: number[] = [];
   private presses: string[] = [];
+  /** Mouse buttons currently held (only tracked while the pointer is locked). */
+  readonly buttons = new Set<number>();
   private readonly listeners: [EventTarget, string, EventListener][] = [];
 
   attach(canvas: HTMLCanvasElement): void {
@@ -31,7 +33,10 @@ export class InputState {
     on(canvas, 'contextmenu', (e) => e.preventDefault());
     on(document, 'pointerlockchange', () => {
       this.pointerLocked = document.pointerLockElement === canvas;
-      if (!this.pointerLocked) this.keys.clear();
+      if (!this.pointerLocked) {
+        this.keys.clear();
+        this.buttons.clear();
+      }
     });
     on(document, 'mousemove', (e) => {
       if (!this.pointerLocked) return;
@@ -40,8 +45,12 @@ export class InputState {
       this.mouseDY += me.movementY;
     });
     on(canvas, 'mousedown', (e) => {
-      if (this.pointerLocked) this.clicks.push((e as MouseEvent).button);
+      if (!this.pointerLocked) return;
+      const button = (e as MouseEvent).button;
+      this.clicks.push(button);
+      this.buttons.add(button);
     });
+    on(window, 'mouseup', (e) => this.buttons.delete((e as MouseEvent).button));
     on(canvas, 'wheel', (e) => {
       this.wheel += Math.sign((e as WheelEvent).deltaY);
       e.preventDefault();
@@ -51,6 +60,10 @@ export class InputState {
   detach(): void {
     for (const [target, type, fn] of this.listeners) target.removeEventListener(type, fn);
     this.listeners.length = 0;
+  }
+
+  isButtonDown(button: number): boolean {
+    return this.buttons.has(button);
   }
 
   isDown(code: string): boolean {

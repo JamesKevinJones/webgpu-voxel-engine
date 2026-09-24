@@ -2,7 +2,7 @@ import { intersectsSolid } from '../physics/aabb';
 import { isOpaque } from '../world/block';
 import { CHUNK_SIZE, chunkKey } from '../world/coords';
 import { buildPaddedVolume, greedyMesh, type VoxelSource } from '../world/mesher';
-import { generateChunkDense } from '../world/terrain';
+import { climateAt, generateChunkDense, surfaceHeight } from '../world/terrain';
 import type { Engine } from './engine';
 import type { EngineStats } from './stats-overlay';
 
@@ -30,6 +30,12 @@ export interface VoxelDebugApi {
   /** Sets the time of day (0..1) and optionally pauses the clock. */
   setTime(t: number, paused?: boolean): void;
   player(): { x: number; y: number; z: number; grounded: boolean; inWater: boolean; embedded: boolean };
+  /** Nearest land column (spiral search) whose dominant biome is `biome`, or null. */
+  findBiome(biome: number): [number, number] | null;
+  /** Breaks a block (with debris particles) as if mined. */
+  breakBlock(x: number, y: number, z: number): boolean;
+  /** Number of live debris particles (CPU mirror of the GPU simulation). */
+  particlesAlive(): number;
   /** PNG data URL of the last rendered frame (offscreen mode). */
   screenshot(): Promise<string>;
 }
@@ -101,6 +107,20 @@ export function installDebugApi(engine: Engine): VoxelDebugApi {
       return null;
     },
     setMode: (mode) => engine.setMode(mode),
+    breakBlock: (x, y, z) => engine.breakBlock(x, y, z),
+    findBiome: (biome) => {
+      const seed = engine.options.seed;
+      for (let r = 0; r < 4000; r += 48) {
+        const steps = Math.max(1, Math.floor((2 * Math.PI * r) / 48));
+        for (let i = 0; i < steps; i++) {
+          const a = (i / steps) * Math.PI * 2;
+          const x = Math.round(Math.cos(a) * r), z = Math.round(Math.sin(a) * r);
+          if (climateAt(x, z, seed).biome === biome && surfaceHeight(x, z, seed) > 6) return [x, z];
+        }
+      }
+      return null;
+    },
+    particlesAlive: () => engine.particles.alive(),
     setTime: (t, paused = true) => {
       engine.timeOfDay = t - Math.floor(t);
       engine.timePaused = paused;

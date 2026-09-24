@@ -9,6 +9,9 @@ import meshSource from '../src/shaders/mesh.wgsl';
 import noiseSource from '../src/shaders/noise.wgsl';
 import skySource from '../src/shaders/sky.wgsl';
 import terrainSource from '../src/shaders/terrain.wgsl';
+import shadowSource from '../src/shaders/shadow.wgsl';
+import overlaySource from '../src/shaders/overlay.wgsl';
+import particlesSource from '../src/shaders/particles.wgsl';
 import worldgenSource from '../src/shaders/worldgen.wgsl';
 import { resolveWgslIncludes } from '../tools/wgsl-loader';
 
@@ -19,7 +22,10 @@ const modules: Record<string, { source: string; entryPoints: string[] }> = {
   'worldgen.wgsl': { source: worldgenSource, entryPoints: ['@compute @workgroup_size(64)\nfn main'] },
   'gather.wgsl': { source: gatherSource, entryPoints: ['@compute @workgroup_size(64)\nfn main'] },
   'mesh.wgsl': { source: meshSource, entryPoints: ['@compute @workgroup_size(32)\nfn main'] },
-  'terrain.wgsl': { source: terrainSource, entryPoints: ['@vertex\nfn vs_main', '@fragment\nfn fs_opaque', '@fragment\nfn fs_water'] },
+  'terrain.wgsl': { source: terrainSource, entryPoints: ['@vertex\nfn vs_main', '@fragment\nfn fs_opaque', '@fragment\nfn fs_cutout', '@fragment\nfn fs_water'] },
+  'shadow.wgsl': { source: shadowSource, entryPoints: ['@vertex\nfn vs_shadow'] },
+  'overlay.wgsl': { source: overlaySource, entryPoints: ['@vertex\nfn vs_box', '@fragment\nfn fs_box', '@vertex\nfn vs_crack', '@fragment\nfn fs_crack'] },
+  'particles.wgsl': { source: particlesSource, entryPoints: ['@compute @workgroup_size(64)\nfn simulate', '@vertex\nfn vs_particle', '@fragment\nfn fs_particle'] },
   'sky.wgsl': { source: skySource, entryPoints: ['@vertex\nfn vs_main', '@fragment\nfn fs_main'] },
 };
 

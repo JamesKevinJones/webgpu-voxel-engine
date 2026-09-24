@@ -141,7 +141,9 @@ try {
 
   mkdirSync(outDir, { recursive: true });
   const capture = async (name) => {
-    await page.waitForTimeout(400);
+    // Wait for two frames rendered after the latest state change (software GPUs are slow).
+    const start = await page.evaluate(() => globalThis.__voxel.engine.completedFrames);
+    await page.waitForFunction((n) => globalThis.__voxel.engine.completedFrames >= n + 2, start, { timeout: 120_000, polling: 100 });
     const png = await page.evaluate(() => globalThis.__voxel.screenshot());
     writeFileSync(join(outDir, name), Buffer.from(png.split(',')[1], 'base64'));
     console.log(`screenshot: ${join(outDir, name)}`);
@@ -157,6 +159,36 @@ try {
   });
   await waitSettled(page, 'ground view');
   await capture('ground-noon.png');
+  await page.evaluate(() => globalThis.__voxel.setTime(0.34));
+  await capture('ground-morning-shadows.png');
+  // Shadow check: render the same view with and without shadow maps and compare.
+  const frameAfter = async (enabled) => {
+    await page.evaluate((on) => { globalThis.__voxel.engine.shadowsEnabled = on; }, enabled);
+    const start = await page.evaluate(() => globalThis.__voxel.engine.completedFrames);
+    await page.waitForFunction((n) => globalThis.__voxel.engine.completedFrames >= n + 2, start, { timeout: 120_000, polling: 100 });
+    await page.evaluate(async (key) => {
+      const f = await globalThis.__voxel.engine.gpu.captureFrame();
+      globalThis[key] = f.pixels;
+    }, enabled ? '__shadowOn' : '__shadowOff');
+  };
+  await frameAfter(true);
+  await frameAfter(false);
+  await page.evaluate(() => { globalThis.__voxel.engine.shadowsEnabled = true; });
+  const shadowed = await page.evaluate(() => {
+    const a = globalThis.__shadowOn, b = globalThis.__shadowOff;
+    let darker = 0, lighter = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      const la = a[i] * 0.2126 + a[i + 1] * 0.7152 + a[i + 2] * 0.0722;
+      const lb = b[i] * 0.2126 + b[i + 1] * 0.7152 + b[i + 2] * 0.0722;
+      if (la < lb * 0.85) darker++;
+      if (la > lb * 1.05 + 2) lighter++;
+    }
+    return { darker: darker / (a.length / 4), lighter: lighter / (a.length / 4) };
+  });
+  console.log(`shadows darken ${(shadowed.darker * 100).toFixed(1)}% of pixels (brighten ${(shadowed.lighter * 100).toFixed(2)}%)`);
+  // Plants sway and water animates between the two captures, so a few pixels change either way.
+  if (shadowed.darker < 0.05) fail('shadow maps have no visible effect');
+  if (shadowed.lighter > 0.02) fail('enabling shadows brightened a significant part of the frame');
   await page.evaluate(() => globalThis.__voxel.setTime(0.755));
   await capture('ground-dusk.png');
   await page.evaluate(() => globalThis.__voxel.setTime(0.02));
@@ -182,6 +214,49 @@ try {
   if (distance < 1) fail('player did not move while walking');
   await capture('walking.png');
   await page.evaluate(() => globalThis.__voxel.setMode('freecam'));
+
+  // Mining: look straight down at the ground from close range and hold the left button.
+  const minedBefore = await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    const y = v.surfaceAt(6, 6) ?? 10;
+    v.setBlock(6, y + 1, 6, 0); // clear any plant so the ground block is the target
+    v.teleport(6.5, y + 2.6, 6.5, 0, -1.5);
+    v.engine.input.buttons.add(0);
+    return v.engine.blocksBroken;
+  });
+  await page.waitForFunction(() => globalThis.__voxel.engine.mining.progress > 0.3, null, { timeout: 120_000, polling: 50 });
+  const mining = await page.evaluate(() => globalThis.__voxel.stats().mining);
+  console.log(`mining progress while holding: ${mining}`);
+  await capture('mining-cracks.png');
+  await page.waitForFunction((n) => globalThis.__voxel.engine.blocksBroken > n, minedBefore, { timeout: 240_000, polling: 20 });
+  const burst = await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    v.engine.input.buttons.delete(0);
+    return { size: v.engine.lastBurstSize, alive: v.particlesAlive() };
+  });
+  console.log(`debris burst: ${burst.size} fragments (${burst.alive} alive)`);
+  if (burst.size < 16 || burst.size > 24 || burst.alive < 16) fail(`expected a burst of 16-24 debris particles, got ${JSON.stringify(burst)}`);
+  await capture('mining-debris.png');
+
+  // Biome tour: one screenshot per biome.
+  for (const [biome, name] of [[0, 'plains'], [1, 'desert'], [2, 'snowy'], [3, 'forest']]) {
+    const spot = await page.evaluate((b) => globalThis.__voxel.findBiome(b), biome);
+    if (!spot) { fail(`no ${name} biome found`); continue; }
+    await page.evaluate(([x, z]) => {
+      const v = globalThis.__voxel;
+      v.teleport(x + 0.5, 90, z + 0.5, 0.6, -0.35);
+    }, spot);
+    await waitSettled(page, `${name} biome`);
+    await page.evaluate(([x, z]) => {
+      const v = globalThis.__voxel;
+      const y = v.surfaceAt(x, z) ?? 20;
+      v.teleport(x + 0.5, Math.max(y, 0) + 30, z + 0.5, 0.6, -0.5);
+    }, spot);
+    await capture(`biome-${name}.png`);
+  }
+  const tour = await page.evaluate(() => globalThis.__voxel.parity(400));
+  console.log(`mesh parity after biome tour: ${tour.meshesCompared - tour.meshMismatches.length} / ${tour.meshesCompared}`);
+  if (tour.meshMismatches.length > 0) fail(`mesh mismatches: ${JSON.stringify(tour.meshMismatches.slice(0, 5))}`);
 
   const finalStats = await page.evaluate(() => globalThis.__voxel.stats());
   console.log(`fps≈${finalStats.fps.toFixed(1)} (software rasteriser) · GPU pools ${finalStats.gpuMemoryMB.toFixed(0)} MB`);

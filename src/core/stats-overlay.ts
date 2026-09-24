@@ -24,6 +24,10 @@ export interface EngineStats {
   timeOfDay: string;
   target: string;
   placeBlock: string;
+  biome: string;
+  mining: string;
+  particles: number;
+  shadows: string;
   seed: number;
 }
 
@@ -41,6 +45,8 @@ export class StatsOverlay {
       ['mode', 'Mode'],
       ['grounded', 'Player'],
       ['time', 'Time of day'],
+      ['biome', 'Biome'],
+      ['shadows', 'Shadows'],
       ['frame', 'Frame'],
       ['chunks', 'Chunks'],
       ['streaming', 'Streaming'],
@@ -55,6 +61,8 @@ export class StatsOverlay {
       ['speed', 'Speed'],
       ['target', 'Target'],
       ['place', 'Place block'],
+      ['mining', 'Mining'],
+      ['particles', 'Particles'],
     ];
     for (const [key, label] of layout) {
       const row = document.createElement('div');
@@ -91,6 +99,10 @@ export class StatsOverlay {
     this.set('speed', `${s.speed.toFixed(1)} m/s`);
     this.set('target', s.target);
     this.set('place', s.placeBlock);
+    this.set('biome', s.biome);
+    this.set('shadows', s.shadows);
+    this.set('mining', s.mining);
+    this.set('particles', String(s.particles));
   }
 
   private set(key: string, text: string): void {

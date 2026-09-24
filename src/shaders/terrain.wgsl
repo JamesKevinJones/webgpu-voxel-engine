@@ -1,16 +1,21 @@
-// Terrain render pipeline: vertex pulling from the compute-generated vertex pools, drawn with
-// drawIndexedIndirect. Blocks are textured from a 16×16 pixel-art texture array. The chunk slot is recovered from vertex_index because each indirect record's
+// Terrain render pipelines: vertex pulling from the compute-generated vertex pools, drawn with
+// drawIndexedIndirect. Blocks are textured from a 16×16 pixel-art texture array, tinted per biome
+// (climate evaluated per vertex, so tints blend smoothly), lit by the sun/moon with cascaded
+// shadow maps. The chunk slot is recovered from vertex_index because each indirect record's
 // baseVertex is slot * VERTEX_CAPACITY.
 #include "common.wgsl"
+#include "climate.wgsl"
 
 @group(0) @binding(1) var<storage, read> vertices: array<u32>;
 @group(0) @binding(2) var<storage, read> chunkOrigins: array<vec4<i32>>;
 @group(0) @binding(3) var blockTextures: texture_2d_array<f32>;
 @group(0) @binding(4) var blockSampler: sampler;
+@group(0) @binding(5) var shadowMap: texture_depth_2d_array;
+@group(0) @binding(6) var shadowSampler: sampler_comparison;
 // Scene depth after the opaque pass (water pipeline only; bound read-only).
 @group(1) @binding(0) var sceneDepth: texture_depth_2d;
 
-// Vertex capacity of one chunk slot in the bound pool (opaque or water pipeline).
+// Vertex capacity of one chunk slot in the bound pool (opaque, water or cutout pipeline).
 override VERTEX_CAPACITY: u32 = 24576u;
 
 struct VertexOut {
@@ -19,6 +24,10 @@ struct VertexOut {
   @location(1) ao: f32,
   @location(2) @interpolate(flat) face: u32,
   @location(3) @interpolate(flat) block: u32,
+  @location(4) tint: vec3<f32>,
+  @location(5) viewDepth: f32,
+  // Cross plants: (u, v) inside the voxel (v = 0 at the top).
+  @location(6) plantUV: vec2<f32>,
 }
 
 @vertex
@@ -35,6 +44,14 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
     world.y -= 0.12; // water surface sits slightly below the block top
   }
   var out: VertexOut;
+  let corner = vi & 3u;
+  out.plantUV = vec2<f32>(select(0.0, 1.0, corner == 1u || corner == 2u), select(1.0, 0.0, corner >= 2u));
+  if (face >= 6u && corner >= 2u) {
+    // Gentle wind sway on the top edge of plants.
+    let t = frame.cameraPos.w;
+    world.x += sin(t * 1.7 + world.z * 0.9 + world.x * 0.3) * 0.06;
+    world.z += cos(t * 1.3 + world.x * 0.8) * 0.06;
+  }
   out.clip = frame.viewProj * vec4<f32>(world, 1.0);
   out.world = world;
   // AO levels 0..3 → light factor, slightly curved for contrast.
@@ -42,10 +59,16 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
   out.ao = mix(0.28, 1.0, aoLinear * aoLinear * 0.35 + aoLinear * 0.65);
   out.face = face;
   out.block = block;
+  let seed = worldSeed();
+  out.tint = grassTint(temperatureAt(world.x, world.z, seed), humidityAt(world.x, world.z, seed));
+  out.viewDepth = dot(world - frame.cameraPos.xyz, frame.cameraDir.xyz);
   return out;
 }
 
 fn faceNormal(face: u32) -> vec3<f32> {
+  if (face >= 6u) {
+    return vec3<f32>(0.0, 1.0, 0.0); // plants are lit like the ground they grow on
+  }
   var n = vec3<f32>(0.0, 0.0, 0.0);
   n[face >> 1u] = select(1.0, -1.0, (face & 1u) == 1u);
   return n;
@@ -63,42 +86,91 @@ fn faceUV(world: vec3<f32>, face: u32) -> vec2<f32> {
   }
 }
 
-// Texture array layer per block and face (see TEXTURE_LAYERS in src/gpu/block-textures.ts).
-fn textureLayer(block: u32, face: u32) -> i32 {
-  let top = face == 2u;
-  let bottom = face == 3u;
-  switch block {
-    case BLOCK_GRASS: { return select(select(TEX_GRASS_SIDE, TEX_DIRT, bottom), TEX_GRASS_TOP, top); }
-    case BLOCK_DIRT: { return TEX_DIRT; }
-    case BLOCK_STONE: { return TEX_STONE; }
-    case BLOCK_SAND: { return TEX_SAND; }
-    case BLOCK_WOOD: { return select(TEX_WOOD_SIDE, TEX_WOOD_TOP, top || bottom); }
-    case BLOCK_LEAVES: { return TEX_LEAVES; }
-    case BLOCK_WATER: { return TEX_WATER; }
-    case BLOCK_BASALT: { return TEX_BASALT; }
-    case BLOCK_BEDROCK: { return TEX_BEDROCK; }
-    default: { return TEX_STONE; }
-  }
-}
-
 fn roughnessOf(block: u32) -> f32 {
   switch block {
     case BLOCK_WATER: { return 0.06; }
+    case BLOCK_ICE, BLOCK_GLASS: { return 0.12; }
     case BLOCK_BASALT: { return 0.55; }
-    case BLOCK_LEAVES: { return 0.7; }
-    case BLOCK_STONE, BLOCK_BEDROCK: { return 0.8; }
+    case BLOCK_LEAVES, BLOCK_PINE_LEAVES: { return 0.7; }
+    case BLOCK_STONE, BLOCK_BEDROCK, BLOCK_COBBLESTONE: { return 0.8; }
     default: { return 0.9; }
   }
 }
 
-// Samples a block texture. Gradients come from the continuous UV so mip selection has no seams
-// at the fract() wrap between voxels of a greedy-merged quad.
-fn sampleBlock(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>, layer: i32) -> vec3<f32> {
-  return textureSampleGrad(blockTextures, blockSampler, fract(uv), layer, ddx, ddy).rgb;
+// Applies the biome tint according to the layer's tint mode (see TINTED_LAYERS).
+fn tinted(texel: vec4<f32>, layer: i32, tint: vec3<f32>) -> vec3<f32> {
+  let mode = tintMode(layer);
+  // The palette is authored in sRGB; the grey tintable textures average ≈ 0.57 linear.
+  let linearTint = pow(tint, vec3<f32>(2.2)) * 1.75;
+  if (mode == 1u) {
+    return texel.rgb * linearTint;
+  }
+  if (mode == 2u) {
+    return mix(texel.rgb, texel.rgb * linearTint, texel.a);
+  }
+  return texel.rgb;
 }
 
-// Directional key light (GGX / Smith / Schlick) plus hemispherical sky ambient with baked AO.
-fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, ao: f32, roughness: f32, f0: f32) -> vec3<f32> {
+// ---------------------------------------------------------------------------------- shadows
+
+fn sampleCascade(cascade: i32, world: vec3<f32>, n: vec3<f32>, nDotL: f32) -> f32 {
+  let texel = select(frame.shadowSplits.w, frame.shadowSplits.z, cascade == 0);
+  // Normal offset grows with the slope to the light: prevents acne on grazing faces.
+  let slope = clamp(sqrt(max(1.0 - nDotL * nDotL, 0.0)) / max(nDotL, 0.05), 0.0, 5.0);
+  let p = world + n * texel * (1.0 + 1.2 * slope);
+  var clipPos = frame.shadowViewProj1 * vec4<f32>(p, 1.0);
+  if (cascade == 0) {
+    clipPos = frame.shadowViewProj0 * vec4<f32>(p, 1.0);
+  }
+  let uv = vec2<f32>(clipPos.x * 0.5 + 0.5, 0.5 - clipPos.y * 0.5);
+  if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clipPos.z > 1.0) {
+    return 1.0;
+  }
+  let depth = clipPos.z - 0.0004;
+  // 3×3 PCF; each tap is itself bilinearly filtered by the comparison sampler.
+  let texelStep = frame.shadowParams.z;
+  var lit = 0.0;
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      let offset = vec2<f32>(f32(dx), f32(dy)) * texelStep;
+      lit += textureSampleCompareLevel(shadowMap, shadowSampler, uv + offset, cascade, depth);
+    }
+  }
+  return lit / 9.0;
+}
+
+// Fraction of direct light reaching `world` (1 = fully lit).
+fn shadowFactor(world: vec3<f32>, n: vec3<f32>, viewDepth: f32) -> f32 {
+  if (frame.shadowParams.x < 0.5) {
+    return 1.0;
+  }
+  let nDotL = dot(n, frame.lightDir.xyz);
+  if (nDotL <= 0.0) {
+    return 0.0;
+  }
+  let split0 = frame.shadowSplits.x;
+  let shadowFar = frame.shadowSplits.y;
+  if (viewDepth >= shadowFar) {
+    return 1.0;
+  }
+  let blend = frame.shadowParams.y;
+  if (viewDepth < split0) {
+    let near = sampleCascade(0, world, n, nDotL);
+    // Cross-fade into cascade 1 over the last part of cascade 0 (no visible seam).
+    let t = smoothstep(split0 * (1.0 - blend), split0, viewDepth);
+    if (t <= 0.0) {
+      return near;
+    }
+    return mix(near, sampleCascade(1, world, n, nDotL), t);
+  }
+  let far = sampleCascade(1, world, n, nDotL);
+  return mix(far, 1.0, smoothstep(shadowFar * (1.0 - blend), shadowFar, viewDepth));
+}
+
+// ---------------------------------------------------------------------------------- lighting
+
+// Directional key light (GGX / Smith / Schlick) with shadows, plus hemispherical sky ambient with baked AO.
+fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, ao: f32, roughness: f32, f0: f32, shadow: f32) -> vec3<f32> {
   let l = frame.lightDir.xyz;
   let v = normalize(frame.cameraPos.xyz - world);
   let h = normalize(l + v);
@@ -115,7 +187,7 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, ao: f32, roughness: 
   let fresnel = f0 + (1.0 - f0) * pow(1.0 - vDotH, 5.0);
   let specular = distribution * geometry * fresnel / max(4.0 * nDotV * nDotL, 1e-3);
   let radiance = frame.lightColor.rgb * frame.lightDir.w;
-  let direct = ((1.0 - fresnel) * albedo / PI + specular) * radiance * nDotL;
+  let direct = ((1.0 - fresnel) * albedo / PI + specular) * radiance * nDotL * shadow;
   // Hemispherical sky light: horizon-tinted from below, zenith-tinted from above.
   let skyAmbient = mix(frame.skyHorizon.rgb * 0.5, frame.skyZenith.rgb * 0.7 + frame.skyHorizon.rgb * 0.35, n.y * 0.5 + 0.5);
   let bounce = vec3<f32>(0.12, 0.10, 0.08) * max(-n.y, 0.0) * frame.lightColor.w;
@@ -124,20 +196,48 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, ao: f32, roughness: 
   return direct * mix(0.5, 1.0, ao) + ambient;
 }
 
+fn finish(color: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
+  let dir = normalize(world - frame.cameraPos.xyz);
+  return toDisplay(mix(color, skyColor(dir), fogAmount(world)));
+}
+
 @fragment
 fn fs_opaque(in: VertexOut) -> @location(0) vec4<f32> {
   let uv = faceUV(in.world, in.face);
   let ddx = dpdx(uv);
   let ddy = dpdy(uv);
   let n = faceNormal(in.face);
+  let layer = textureLayer(in.block, in.face);
+  let texel = textureSampleGrad(blockTextures, blockSampler, fract(uv), layer, ddx, ddy);
   // Subtle per-block tone variation breaks up repetition of the 16×16 tiles.
   let cell = floor(in.world - n * 0.5);
   let tone = 0.94 + 0.12 * hash31(cell + vec3<f32>(0.37, 11.1, 5.3));
-  let albedo = sampleBlock(uv, ddx, ddy, textureLayer(in.block, in.face)) * tone;
-  var color = shade(albedo, n, in.world, in.ao, roughnessOf(in.block), 0.04);
-  let dir = normalize(in.world - frame.cameraPos.xyz);
-  color = mix(color, skyColor(dir), fogAmount(in.world));
-  return vec4<f32>(toDisplay(color), 1.0);
+  let albedo = tinted(texel, layer, in.tint) * tone;
+  let shadow = shadowFactor(in.world, n, in.viewDepth);
+  let color = shade(albedo, n, in.world, in.ao, roughnessOf(in.block), 0.04, shadow);
+  return vec4<f32>(finish(color, in.world), 1.0);
+}
+
+// Alpha-tested geometry: glass faces and cross plants.
+@fragment
+fn fs_cutout(in: VertexOut) -> @location(0) vec4<f32> {
+  let cross = in.face >= 6u;
+  let worldUV = faceUV(in.world, in.face);
+  let uv = select(worldUV, in.plantUV, cross);
+  let ddx = dpdx(uv);
+  let ddy = dpdy(uv);
+  let layer = textureLayer(in.block, in.face);
+  let sampleUV = select(fract(uv), clamp(uv, vec2<f32>(0.001), vec2<f32>(0.999)), cross);
+  let texel = textureSampleGrad(blockTextures, blockSampler, sampleUV, layer, ddx, ddy);
+  if (texel.a < 0.5) {
+    discard;
+  }
+  let n = faceNormal(in.face);
+  let albedo = tinted(texel, layer, in.tint);
+  let shadow = shadowFactor(in.world, n, in.viewDepth);
+  let ao = select(in.ao, 1.0, cross);
+  let color = shade(albedo, n, in.world, ao, roughnessOf(in.block), 0.04, shadow);
+  return vec4<f32>(finish(color, in.world), 1.0);
 }
 
 const WATER_SHALLOW: vec3<f32> = vec3<f32>(0.10, 0.42, 0.45);
@@ -155,7 +255,8 @@ fn fs_water(in: VertexOut) -> @location(0) vec4<f32> {
   let d1y = dpdy(uv1);
   let d2x = dpdx(uv2);
   let d2y = dpdy(uv2);
-  let tex = 0.5 * (sampleBlock(uv1, d1x, d1y, TEX_WATER) + sampleBlock(uv2, d2x, d2y, TEX_WATER));
+  let tex = 0.5 * (textureSampleGrad(blockTextures, blockSampler, fract(uv1), TEX_WATER, d1x, d1y).rgb +
+    textureSampleGrad(blockTextures, blockSampler, fract(uv2), TEX_WATER, d2x, d2y).rgb);
 
   var n = faceNormal(in.face);
   if (in.face == 2u) {
@@ -176,7 +277,8 @@ fn fs_water(in: VertexOut) -> @location(0) vec4<f32> {
   let v = normalize(frame.cameraPos.xyz - in.world);
   let cosTheta = abs(dot(n, v));
   let fresnel = 0.02 + 0.98 * pow(1.0 - cosTheta, 5.0);
-  let lit = shade(albedo, n, in.world, in.ao, 0.06, 0.02);
+  let shadow = shadowFactor(in.world, faceNormal(in.face), in.viewDepth);
+  let lit = shade(albedo, n, in.world, in.ao, 0.06, 0.02, shadow);
   let reflection = skyColor(reflect(-v, n));
   var color = mix(lit, reflection, fresnel);
   var alpha = clamp(mix(0.18, 0.93, absorb) + fresnel * 0.5, 0.0, 0.97);

@@ -2,6 +2,7 @@ import './style.css';
 import { installDebugApi } from './core/debug';
 import { DEFAULT_ENGINE_OPTIONS, Engine } from './core/engine';
 import { WebGpuUnavailableError } from './core/gpu-context';
+import { HotbarView } from './core/hotbar';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#viewport')!;
 const statsRoot = document.querySelector<HTMLElement>('#stats');
@@ -52,6 +53,15 @@ try {
   document.addEventListener('pointerlockchange', () => {
     if (hint) hint.hidden = document.pointerLockElement === canvas;
   });
+  const hotbarRoot = document.querySelector<HTMLElement>('#hotbar');
+  if (hotbarRoot) {
+    const hotbar = new HotbarView(hotbarRoot, engine.hotbar);
+    const refresh = (): void => {
+      hotbar.update();
+      requestAnimationFrame(refresh);
+    };
+    requestAnimationFrame(refresh);
+  }
   installDebugApi(engine);
   engine.start();
 } catch (err) {
