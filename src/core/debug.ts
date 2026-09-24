@@ -96,6 +96,7 @@ export function installDebugApi(engine: Engine): VoxelDebugApi {
       engine.camera.position[0] = x;
       engine.camera.position[1] = y;
       engine.camera.position[2] = z;
+      engine.controller.velocity.fill(0);
       if (yaw !== undefined) engine.camera.yaw = yaw;
       if (pitch !== undefined) engine.camera.setPitch(pitch);
     },

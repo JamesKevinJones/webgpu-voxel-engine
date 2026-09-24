@@ -197,15 +197,19 @@ try {
 
   // Walking mode: drop the player onto the terrain, then walk forward for a while.
   await page.evaluate(() => globalThis.__voxel.setMode('walk'));
-  // Frame deltas are clamped to 0.1 s, so on a slow software GPU simulated time runs behind wall time.
-  const physicsSeconds = (seconds) => page.waitForTimeout(seconds * 1000);
-  await physicsSeconds(6);
+  // Frame deltas are clamped to 0.1 s, so on a slow software GPU simulated time runs far behind
+  // wall time: wait for the conditions themselves (with generous timeouts) instead of fixed delays.
+  const waitFor = (fn, arg) => page.waitForFunction(fn, arg, { timeout: 300_000, polling: 250 }).then(() => true, () => false);
+  await waitFor(() => { const p = globalThis.__voxel.player(); return p.grounded || p.inWater; });
   const landed = await page.evaluate(() => globalThis.__voxel.player());
   console.log(`player after drop: ${JSON.stringify(landed)} (surface ${ground})`);
   if (landed.embedded) fail('player is embedded in terrain after landing');
   if (!landed.grounded && !landed.inWater) fail('player did not land on the terrain');
   await page.evaluate(() => globalThis.__voxel.engine.input.keys.add('KeyW'));
-  await physicsSeconds(6);
+  await waitFor((start) => {
+    const p = globalThis.__voxel.player();
+    return Math.hypot(p.x - start.x, p.z - start.z) > 2;
+  }, landed);
   await page.evaluate(() => globalThis.__voxel.engine.input.keys.delete('KeyW'));
   const walked = await page.evaluate(() => globalThis.__voxel.player());
   const distance = Math.hypot(walked.x - landed.x, walked.z - landed.z);
@@ -253,6 +257,9 @@ try {
       v.teleport(x + 0.5, Math.max(y, 0) + 30, z + 0.5, 0.6, -0.5);
     }, spot);
     await capture(`biome-${name}.png`);
+    const view = await page.evaluate(() => { const s = globalThis.__voxel.stats(); return { camera: s.camera, biome: s.biome, visible: s.visibleChunks }; });
+    console.log(`${name}: ${JSON.stringify(view)}`);
+    if (view.visible === 0) fail(`${name} view shows no chunks`);
   }
   const tour = await page.evaluate(() => globalThis.__voxel.parity(400));
   console.log(`mesh parity after biome tour: ${tour.meshesCompared - tour.meshMismatches.length} / ${tour.meshesCompared}`);
