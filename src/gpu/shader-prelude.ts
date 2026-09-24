@@ -1,0 +1,146 @@
+import { BLOCK_TYPE_COUNT, BlockType, renderClass, type RenderClass } from '../world/block';
+import { CHUNK_SIZE, CHUNK_VOLUME } from '../world/coords';
+import {
+  INDIRECT_ARGS_WORDS,
+  MESH_COUNTER_WORDS,
+  MESH_JOB_NEIGHBOR_OFFSET,
+  MESH_JOB_WORDS,
+  NO_SLOT,
+  OPAQUE_QUAD_CAPACITY,
+  CUTOUT_QUAD_CAPACITY,
+  CUTOUT_VERTEX_CAPACITY,
+  OPAQUE_VERTEX_CAPACITY,
+  PADDED_SIZE,
+  PADDED_VOLUME,
+  PADDED_WORDS,
+  WATER_QUAD_CAPACITY,
+  WATER_VERTEX_CAPACITY,
+} from '../world/mesh-format';
+import { TEXTURE_LAYERS, textureFunctions } from './block-textures';
+import { PARTICLE_FRICTION, PARTICLE_RESTITUTION } from '../fx/particles';
+import { GPU_DATA_OFFSET, GPU_PALETTE_OFFSET, GPU_SLOT_WORDS } from '../world/palette-chunk';
+import {
+  BEACH_MAX_Y,
+  CAVE_MAX_Y,
+  CAVE_MIN_DENSITY,
+  CAVE_MIN_Y,
+  DETAIL_AMPLITUDE,
+  DETAIL_FADE_END,
+  DETAIL_FADE_START,
+  GRASS_MAX_Y,
+  PEAK_Y,
+  SEA_LEVEL,
+  SURFACE_SEARCH,
+  TREE_CELL,
+  TREE_RADIUS,
+  WORLD_MAX_Y,
+  WORLD_MIN_Y,
+} from '../world/terrain';
+import { MAX_GPU_PALETTE } from '../world/block';
+
+type WgslScalar = 'u32' | 'i32' | 'f32';
+
+function toSnake(name: string): string {
+  return name.replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase();
+}
+
+/** Render classes as WGSL integers (see `RenderClass`). */
+export const RENDER_CLASS_IDS: Record<RenderClass, number> = { none: 0, opaque: 1, water: 2, cutout: 3, cross: 4 };
+
+/**
+ * Constants injected in front of every WGSL module so that buffer layouts, capacities and
+ * block ids have a single source of truth in TypeScript.
+ */
+export const SHADER_CONSTANTS: readonly (readonly [string, number, WgslScalar])[] = [
+  ['CHUNK_SIZE', CHUNK_SIZE, 'u32'],
+  ['CHUNK_SIZE_I', CHUNK_SIZE, 'i32'],
+  ['CHUNK_VOLUME', CHUNK_VOLUME, 'u32'],
+  ['SLOT_WORDS', GPU_SLOT_WORDS, 'u32'],
+  ['GPU_PALETTE_OFFSET', GPU_PALETTE_OFFSET, 'u32'],
+  ['GPU_DATA_OFFSET', GPU_DATA_OFFSET, 'u32'],
+  ['PADDED_SIZE', PADDED_SIZE, 'u32'],
+  ['PADDED_SIZE_I', PADDED_SIZE, 'i32'],
+  ['PADDED_VOLUME', PADDED_VOLUME, 'u32'],
+  ['PADDED_WORDS', PADDED_WORDS, 'u32'],
+  ['MESH_JOB_WORDS', MESH_JOB_WORDS, 'u32'],
+  ['MESH_JOB_NEIGHBOR_OFFSET', MESH_JOB_NEIGHBOR_OFFSET, 'u32'],
+  ['NO_SLOT', NO_SLOT, 'u32'],
+  ['OPAQUE_QUAD_CAPACITY', OPAQUE_QUAD_CAPACITY, 'u32'],
+  ['WATER_QUAD_CAPACITY', WATER_QUAD_CAPACITY, 'u32'],
+  ['OPAQUE_VERTEX_CAPACITY', OPAQUE_VERTEX_CAPACITY, 'u32'],
+  ['CUTOUT_QUAD_CAPACITY', CUTOUT_QUAD_CAPACITY, 'u32'],
+  ['CUTOUT_VERTEX_CAPACITY', CUTOUT_VERTEX_CAPACITY, 'u32'],
+  ['MESH_POOLS', 3, 'u32'],
+  ['RC_NONE', RENDER_CLASS_IDS.none, 'u32'],
+  ['RC_OPAQUE', RENDER_CLASS_IDS.opaque, 'u32'],
+  ['RC_WATER', RENDER_CLASS_IDS.water, 'u32'],
+  ['RC_CUTOUT', RENDER_CLASS_IDS.cutout, 'u32'],
+  ['RC_CROSS', RENDER_CLASS_IDS.cross, 'u32'],
+  ['WATER_VERTEX_CAPACITY', WATER_VERTEX_CAPACITY, 'u32'],
+  ['INDIRECT_ARGS_WORDS', INDIRECT_ARGS_WORDS, 'u32'],
+  ['MESH_COUNTER_WORDS', MESH_COUNTER_WORDS, 'u32'],
+  ...Object.entries(BlockType).map(([name, id]) => [`BLOCK_${toSnake(name)}`, id, 'u32'] as const),
+  ['SEA_LEVEL', SEA_LEVEL, 'i32'],
+  ['WORLD_MIN_Y', WORLD_MIN_Y, 'i32'],
+  ['BEACH_MAX_Y', BEACH_MAX_Y, 'i32'],
+  ['GRASS_MAX_Y', GRASS_MAX_Y, 'i32'],
+  ['CAVE_MIN_Y', CAVE_MIN_Y, 'i32'],
+  ['CAVE_MAX_Y', CAVE_MAX_Y, 'i32'],
+  ['CAVE_MIN_DENSITY', CAVE_MIN_DENSITY, 'f32'],
+  ['DETAIL_AMPLITUDE', DETAIL_AMPLITUDE, 'f32'],
+  ['SURFACE_SEARCH', SURFACE_SEARCH, 'i32'],
+  ['TREE_CELL', TREE_CELL, 'i32'],
+  ['TREE_RADIUS', TREE_RADIUS, 'i32'],
+  ['WORLD_MAX_Y', WORLD_MAX_Y, 'i32'],
+  ['PEAK_Y', PEAK_Y, 'i32'],
+  ['DETAIL_FADE_START', DETAIL_FADE_START, 'f32'],
+  ['DETAIL_FADE_END', DETAIL_FADE_END, 'f32'],
+  ['MAX_GPU_PALETTE', MAX_GPU_PALETTE, 'u32'],
+  ['PARTICLE_RESTITUTION', PARTICLE_RESTITUTION, 'f32'],
+  ['PARTICLE_FRICTION', PARTICLE_FRICTION, 'f32'],
+  ...TEXTURE_LAYERS.map((name, i) => [`TEX_${name.toUpperCase()}`, i, 'i32'] as const),
+];
+
+function literal(value: number, type: WgslScalar): string {
+  switch (type) {
+    case 'u32':
+      if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw new RangeError(`bad u32 ${value}`);
+      return `${value}u`;
+    case 'i32':
+      if (!Number.isInteger(value)) throw new RangeError(`bad i32 ${value}`);
+      return value < 0 ? `(${value}i)` : `${value}i`;
+    case 'f32':
+      return Number.isInteger(value) ? `${value}.0` : `${value}`;
+  }
+}
+
+/** WGSL lookup of each block's render class, generated from the TypeScript block table. */
+export function renderClassFunction(): string {
+  const cases = new Map<number, number[]>();
+  for (let b = 0; b < BLOCK_TYPE_COUNT; b++) {
+    const id = RENDER_CLASS_IDS[renderClass(b)];
+    cases.set(id, [...(cases.get(id) ?? []), b]);
+  }
+  const lines = ['fn blockRenderClass(block: u32) -> u32 {', '  switch block {'];
+  for (const [id, blocks] of cases) {
+    if (id === RENDER_CLASS_IDS.none) continue;
+    lines.push(`    case ${blocks.map((b) => `${b}u`).join(', ')}: { return ${id}u; }`);
+  }
+  lines.push(`    default: { return ${RENDER_CLASS_IDS.none}u; }`, '  }', '}');
+  return lines.join('\n');
+}
+
+export function shaderPrelude(): string {
+  return [
+    '// ---- generated by src/gpu/shader-prelude.ts ----',
+    ...SHADER_CONSTANTS.map(([name, value, type]) => `const ${name}: ${type} = ${literal(value, type)};`),
+    renderClassFunction(),
+    textureFunctions(),
+    '',
+  ].join('\n');
+}
+
+/** Prepends the generated constants to a WGSL module source. */
+export function withPrelude(source: string): string {
+  return `${shaderPrelude()}\n${source}`;
+}
