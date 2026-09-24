@@ -1,8 +1,9 @@
 // Terrain render pipelines: vertex pulling from the compute-generated vertex pools, drawn with
 // drawIndexedIndirect. Blocks are textured from a 16×16 pixel-art texture array, tinted per biome
 // (climate evaluated per vertex, so tints blend smoothly), lit by the sun/moon with cascaded
-// shadow maps. The chunk slot is recovered from vertex_index because each indirect record's
-// baseVertex is slot * VERTEX_CAPACITY.
+// shadow maps and by the flood-filled voxel light (skylight + torch light, smoothed per vertex by
+// the mesher). The chunk slot is recovered from vertex_index because each indirect record's
+// baseVertex is slot * VERTEX_CAPACITY; the quad's light word sits at LIGHT_OFFSET + vertex / 4.
 #include "common.wgsl"
 #include "climate.wgsl"
 
@@ -17,6 +18,10 @@
 
 // Vertex capacity of one chunk slot in the bound pool (opaque, water or cutout pipeline).
 override VERTEX_CAPACITY: u32 = 24576u;
+// First light word of the bound pool (mesh slots × VERTEX_CAPACITY).
+override LIGHT_OFFSET: u32 = 0u;
+
+const TORCH_COLOR: vec3<f32> = vec3<f32>(1.0, 0.63, 0.32);
 
 struct VertexOut {
   @builtin(position) clip: vec4<f32>,
@@ -28,6 +33,21 @@ struct VertexOut {
   @location(5) viewDepth: f32,
   // Cross plants: (u, v) inside the voxel (v = 0 at the top).
   @location(6) plantUV: vec2<f32>,
+  // Smoothed voxel light: x = skylight, y = block (torch) light, both 0..1.
+  @location(7) light: vec2<f32>,
+}
+
+fn isWater(b: u32) -> bool {
+  return b == BLOCK_WATER || (b >= BLOCK_WATER_FLOW1 && b <= BLOCK_WATER_FALLING);
+}
+
+// How far the top edge of a water cell sits below the cell top (flowing water drops per level).
+fn waterDrop(b: u32) -> f32 {
+  var surface = 8.0;
+  if (b >= BLOCK_WATER_FLOW1 && b <= BLOCK_WATER_FLOW7) {
+    surface = f32(8u - (b - BLOCK_WATER_FLOW1 + 1u));
+  }
+  return 1.0 - surface / 8.0 * 0.88;
 }
 
 @vertex
@@ -40,13 +60,25 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOut {
   let ao = (packed >> 21u) & 3u;
   let block = (packed >> 23u) & 31u;
   var world = origin + local;
-  if (block == BLOCK_WATER && face == 2u) {
-    world.y -= 0.12; // water surface sits slightly below the block top
+  let corner = vi & 3u;
+  if (isWater(block) && face != 3u) {
+    // Water quads are never rotated (their AO is uniform), so the corner index tells which
+    // vertices are on the top edge: lower them to the water surface (sources sit 0.12 below the
+    // block top, flowing water lower per level; waterfall sides stay full height).
+    let c = select(corner, (4u - corner) & 3u, (face & 1u) == 1u);
+    let cu = c == 1u || c == 2u;
+    let cv = c >= 2u;
+    let top = face == 2u || (face <= 1u && cu) || (face >= 4u && cv);
+    if (top && (face == 2u || block != BLOCK_WATER_FALLING)) {
+      world.y -= waterDrop(block);
+    }
   }
   var out: VertexOut;
-  let corner = vi & 3u;
   out.plantUV = vec2<f32>(select(0.0, 1.0, corner == 1u || corner == 2u), select(1.0, 0.0, corner >= 2u));
-  if (face >= 6u && corner >= 2u) {
+  let lightWord = vertices[LIGHT_OFFSET + (vi >> 2u)];
+  let lightByte = (lightWord >> (corner * 8u)) & 0xffu;
+  out.light = vec2<f32>(f32(lightByte >> 4u), f32(lightByte & 15u)) / 15.0;
+  if (face >= 6u && corner >= 2u && block != BLOCK_TORCH) {
     // Gentle wind sway on the top edge of plants.
     let t = frame.cameraPos.w;
     world.x += sin(t * 1.7 + world.z * 0.9 + world.x * 0.3) * 0.06;
@@ -88,7 +120,7 @@ fn faceUV(world: vec3<f32>, face: u32) -> vec2<f32> {
 
 fn roughnessOf(block: u32) -> f32 {
   switch block {
-    case BLOCK_WATER: { return 0.06; }
+    case BLOCK_WATER, BLOCK_WATER_FALLING: { return 0.06; }
     case BLOCK_ICE, BLOCK_GLASS: { return 0.12; }
     case BLOCK_BASALT: { return 0.55; }
     case BLOCK_LEAVES, BLOCK_PINE_LEAVES: { return 0.7; }
@@ -169,8 +201,11 @@ fn shadowFactor(world: vec3<f32>, n: vec3<f32>, viewDepth: f32) -> f32 {
 
 // ---------------------------------------------------------------------------------- lighting
 
-// Directional key light (GGX / Smith / Schlick) with shadows, plus hemispherical sky ambient with baked AO.
-fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, ao: f32, roughness: f32, f0: f32, shadow: f32) -> vec3<f32> {
+// Directional key light (GGX / Smith / Schlick) with shadows, hemispherical sky ambient with baked
+// AO, and warm torch light. `light` is the voxel light (sky, block): skylight gates the sun (voxels
+// the flood fill says are enclosed never see it, even beyond the shadow maps) and scales the sky
+// ambient quadratically, so caves fall off into darkness; block light adds a torch-coloured term.
+fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, ao: f32, roughness: f32, f0: f32, shadow: f32, light: vec2<f32>) -> vec3<f32> {
   let l = frame.lightDir.xyz;
   let v = normalize(frame.cameraPos.xyz - world);
   let h = normalize(l + v);
@@ -187,12 +222,17 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>, world: vec3<f32>, ao: f32, roughness: 
   let fresnel = f0 + (1.0 - f0) * pow(1.0 - vDotH, 5.0);
   let specular = distribution * geometry * fresnel / max(4.0 * nDotV * nDotL, 1e-3);
   let radiance = frame.lightColor.rgb * frame.lightDir.w;
-  let direct = ((1.0 - fresnel) * albedo / PI + specular) * radiance * nDotL * shadow;
+  let sky = light.x;
+  let sunVisible = smoothstep(0.2, 0.75, sky);
+  let direct = ((1.0 - fresnel) * albedo / PI + specular) * radiance * nDotL * shadow * sunVisible;
   // Hemispherical sky light: horizon-tinted from below, zenith-tinted from above.
   let skyAmbient = mix(frame.skyHorizon.rgb * 0.5, frame.skyZenith.rgb * 0.7 + frame.skyHorizon.rgb * 0.35, n.y * 0.5 + 0.5);
   let bounce = vec3<f32>(0.12, 0.10, 0.08) * max(-n.y, 0.0) * frame.lightColor.w;
   let night = vec3<f32>(0.012, 0.016, 0.03);
-  let ambient = albedo * (skyAmbient + bounce + night) * ao;
+  let skyFactor = sky * sky;
+  let torch = TORCH_COLOR * (pow(light.y, 2.4) * 1.9);
+  let cave = vec3<f32>(0.004, 0.005, 0.007);
+  let ambient = albedo * ((skyAmbient + bounce + night) * skyFactor + torch + cave) * ao;
   return direct * mix(0.5, 1.0, ao) + ambient;
 }
 
@@ -214,11 +254,11 @@ fn fs_opaque(in: VertexOut) -> @location(0) vec4<f32> {
   let tone = 0.94 + 0.12 * hash31(cell + vec3<f32>(0.37, 11.1, 5.3));
   let albedo = tinted(texel, layer, in.tint) * tone;
   let shadow = shadowFactor(in.world, n, in.viewDepth);
-  let color = shade(albedo, n, in.world, in.ao, roughnessOf(in.block), 0.04, shadow);
+  let color = shade(albedo, n, in.world, in.ao, roughnessOf(in.block), 0.04, shadow, in.light);
   return vec4<f32>(finish(color, in.world), 1.0);
 }
 
-// Alpha-tested geometry: glass faces and cross plants.
+// Alpha-tested geometry: glass faces, cross plants and torches.
 @fragment
 fn fs_cutout(in: VertexOut) -> @location(0) vec4<f32> {
   let cross = in.face >= 6u;
@@ -236,7 +276,10 @@ fn fs_cutout(in: VertexOut) -> @location(0) vec4<f32> {
   let albedo = tinted(texel, layer, in.tint);
   let shadow = shadowFactor(in.world, n, in.viewDepth);
   let ao = select(in.ao, 1.0, cross);
-  let color = shade(albedo, n, in.world, ao, roughnessOf(in.block), 0.04, shadow);
+  var color = shade(albedo, n, in.world, ao, roughnessOf(in.block), 0.04, shadow, in.light);
+  if (in.block == BLOCK_TORCH && in.plantUV.y < 0.42) {
+    color = albedo * 3.2; // the flame glows
+  }
   return vec4<f32>(finish(color, in.world), 1.0);
 }
 
@@ -278,8 +321,9 @@ fn fs_water(in: VertexOut) -> @location(0) vec4<f32> {
   let cosTheta = abs(dot(n, v));
   let fresnel = 0.02 + 0.98 * pow(1.0 - cosTheta, 5.0);
   let shadow = shadowFactor(in.world, faceNormal(in.face), in.viewDepth);
-  let lit = shade(albedo, n, in.world, in.ao, 0.06, 0.02, shadow);
-  let reflection = skyColor(reflect(-v, n));
+  let lit = shade(albedo, n, in.world, in.ao, 0.06, 0.02, shadow, in.light);
+  // Enclosed water (caves) does not mirror the sky.
+  let reflection = skyColor(reflect(-v, n)) * (0.08 + 0.92 * in.light.x * in.light.x);
   var color = mix(lit, reflection, fresnel);
   var alpha = clamp(mix(0.18, 0.93, absorb) + fresnel * 0.5, 0.0, 0.97);
   let fog = fogAmount(in.world);

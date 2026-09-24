@@ -9,8 +9,13 @@
  *   - worldgen.wgsl output matches the CPU terrain mirror (tolerating rare f32 rounding),
  *   - gather.wgsl + mesh.wgsl quad counts exactly match the CPU reference greedy mesher,
  *   - a CPU-side voxel edit is uploaded and re-meshed consistently,
- *   - walking mode lands the player on the terrain and walks without clipping into it.
- * Screenshots (noon / dusk / night / walking) are written to scripts/out/.
+ *   - walking mode lands the player on the terrain and walks without clipping into it,
+ *   - flood-fill lighting: skylight outdoors, darkness in sealed rock, torch light that brightens
+ *     the rendered frame,
+ *   - flowing water spreads (bounded to 7 levels) and is re-meshed,
+ *   - edits persist in IndexedDB across a page reload,
+ *   - the title screen / pause menu / F3 overlay work.
+ * Screenshots are written to scripts/out/.
  *
  * Usage: npm run build && npm run test:gpu   (needs Playwright + a Chromium build)
  */
@@ -242,6 +247,105 @@ try {
   if (burst.size < 16 || burst.size > 24 || burst.alive < 16) fail(`expected a burst of 16-24 debris particles, got ${JSON.stringify(burst)}`);
   await capture('mining-debris.png');
 
+  // Lighting: skylight outdoors, darkness in sealed rock, torch light in a dug room.
+  const outdoor = await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    const top = v.surfaceAt(8, 8);
+    return { top, above: v.light(8, top + 2, 8), deep: v.light(8, -55, 8), deepBlock: v.block(8, -55, 8) };
+  });
+  console.log(`skylight above ground ${JSON.stringify(outdoor.above)}, in rock ${JSON.stringify(outdoor.deep)}`);
+  if (outdoor.above.sky !== 15) fail('open air above the surface is not fully sky-lit');
+  if (outdoor.deep.sky !== 0) fail('sealed rock deep underground received skylight');
+  // A sealed 5×3×5 room below the cave layer (y < -40 is solid stone).
+  await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    for (let x = 20; x <= 24; x++) for (let y = -52; y <= -50; y++) for (let z = 20; z <= 24; z++) v.setBlock(x, y, z, 0);
+    v.setTime(0.5);
+    v.teleport(20.6, -50.4, 22.5, -Math.PI / 2 + 0.25, -0.2);
+  });
+  await waitSettled(page, 'dug room');
+  const roomBefore = await page.evaluate(() => globalThis.__voxel.light(22, -51, 22));
+  const meanLuma = async () => {
+    const start = await page.evaluate(() => globalThis.__voxel.engine.completedFrames);
+    await page.waitForFunction((n) => globalThis.__voxel.engine.completedFrames >= n + 2, start, { timeout: 120_000, polling: 100 });
+    return page.evaluate(async () => {
+      const f = await globalThis.__voxel.engine.gpu.captureFrame();
+      let sum = 0;
+      for (let i = 0; i < f.pixels.length; i += 4) sum += f.pixels[i] * 0.2126 + f.pixels[i + 1] * 0.7152 + f.pixels[i + 2] * 0.0722;
+      return sum / (f.pixels.length / 4);
+    });
+  };
+  const dark = await meanLuma();
+  await capture('room-dark.png');
+  const placed = await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    v.engine.hotbar.select(7); // torch
+    return v.place(23, -52, 22);
+  });
+  await waitSettled(page, 'torch');
+  const torchLight = await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    return { torch: v.light(23, -52, 22), next: v.light(24, -52, 22), corner: v.light(20, -52, 20), block: v.block(23, -52, 22) };
+  });
+  const lit = await meanLuma();
+  await capture('room-torch.png');
+  console.log(`room light before ${JSON.stringify(roomBefore)}; torch placed=${placed} ${JSON.stringify(torchLight)}; mean luminance ${dark.toFixed(1)} → ${lit.toFixed(1)}`);
+  if (roomBefore.sky !== 0 || roomBefore.block !== 0) fail('the sealed room is not dark before the torch');
+  if (!placed || torchLight.block !== 23) fail('torch was not placed');
+  if (torchLight.torch.block !== 14 || torchLight.next.block !== 13 || torchLight.corner.block !== 14 - 5) fail(`unexpected torch light falloff ${JSON.stringify(torchLight)}`);
+  if (lit < dark + 8 || lit < dark * 2) fail('the torch did not visibly light the room');
+  const lightParity = await page.evaluate(() => globalThis.__voxel.parity(400));
+  console.log(`mesh parity with lighting: ${lightParity.meshesCompared - lightParity.meshMismatches.length} / ${lightParity.meshesCompared}`);
+  if (lightParity.meshMismatches.length > 0) fail(`mesh mismatches after torch: ${JSON.stringify(lightParity.meshMismatches.slice(0, 5))}`);
+
+  // Night scene with torches on the surface.
+  await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    for (const [x, z] of [[14, 14], [22, 12], [12, 24], [26, 22]]) {
+      const y = v.surfaceAt(x, z);
+      if (y !== null && v.block(x, y + 1, z) >= 0) { v.setBlock(x, y + 1, z, 0); v.setBlock(x, y + 1, z, 23); }
+    }
+    const y = v.surfaceAt(20, 20) ?? 20;
+    v.teleport(20.5, Math.max(y, 0) + 6, 34.5, 0.1, -0.35);
+    v.setTime(0.0);
+  });
+  await waitSettled(page, 'night torches');
+  await capture('night-torches.png');
+  await page.evaluate(() => globalThis.__voxel.setTime(0.5));
+
+  // Water: pour a source onto the ground and let the cellular automaton run.
+  const pour = await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    const x = 40, z = 40;
+    const y = (v.surfaceAt(x, z) ?? 10) + 1;
+    v.setBlock(x, y, z, 0);
+    v.setBlock(x, y, z, 5);
+    v.teleport(x + 0.5, y + 10, z + 14.5, 0, -0.6);
+    return { x, y, z };
+  });
+  await waitSettled(page, 'water flow');
+  const flow = await page.evaluate(({ x, y, z }) => {
+    const v = globalThis.__voxel;
+    const levels = {};
+    let cells = 0, far = 0;
+    for (let dx = -12; dx <= 12; dx++) for (let dz = -12; dz <= 12; dz++) for (let dy = -12; dy <= 1; dy++) {
+      const b = v.block(x + dx, y + dy, z + dz);
+      if (b === 5 || b >= 24) {
+        cells++;
+        levels[b] = (levels[b] ?? 0) + 1;
+        if (Math.abs(dx) + Math.abs(dz) > 11) far++;
+      }
+    }
+    return { cells, levels, far, source: v.block(x, y, z), fluid: { ticks: v.engine.fluids.ticks, changes: v.engine.fluids.totalChanges } };
+  }, pour);
+  console.log(`water flow: ${JSON.stringify(flow)}`);
+  if (flow.source !== 5) fail('the water source disappeared');
+  if (flow.cells < 5) fail('water did not spread');
+  await capture('water-flow.png');
+  const waterParity = await page.evaluate(() => globalThis.__voxel.parity(400));
+  console.log(`mesh parity after water flow: ${waterParity.meshesCompared - waterParity.meshMismatches.length} / ${waterParity.meshesCompared}`);
+  if (waterParity.meshMismatches.length > 0) fail(`mesh mismatches after water flow: ${JSON.stringify(waterParity.meshMismatches.slice(0, 5))}`);
+
   // Biome tour: one screenshot per biome.
   for (const [biome, name] of [[0, 'plains'], [1, 'desert'], [2, 'snowy'], [3, 'forest']]) {
     const spot = await page.evaluate((b) => globalThis.__voxel.findBiome(b), biome);
@@ -265,8 +369,79 @@ try {
   console.log(`mesh parity after biome tour: ${tour.meshesCompared - tour.meshMismatches.length} / ${tour.meshesCompared}`);
   if (tour.meshMismatches.length > 0) fail(`mesh mismatches: ${JSON.stringify(tour.meshMismatches.slice(0, 5))}`);
 
+  // Persistence: save to IndexedDB, reload the page and find the edits again.
+  const savedEdits = await page.evaluate(async () => {
+    const g = globalThis.__game;
+    const v = globalThis.__voxel;
+    v.teleport(22.5, -51, 22.5, 0, 0);
+    await g.save(false);
+    return v.engine.delta.editCount;
+  });
+  await page.reload();
+  await page.waitForFunction(() => '__voxel' in globalThis && globalThis.__game?.state === 'playing', null, { timeout: 60_000 });
+  await waitSettled(page, 'after reload');
+  const restored = await page.evaluate(() => {
+    const v = globalThis.__voxel;
+    const p = v.engine.camera.position;
+    return { edits: v.engine.delta.editCount, torch: v.block(23, -52, 22), torchLight: v.light(23, -52, 22), room: v.block(21, -51, 21), camera: [p[0], p[1], p[2]] };
+  });
+  console.log(`persistence: saved ${savedEdits} edits, reloaded ${JSON.stringify(restored)}`);
+  if (restored.edits !== savedEdits) fail('saved edits were not restored from IndexedDB');
+  if (restored.torch !== 23 || restored.room !== 0 || restored.torchLight.block !== 14) fail('edits were not re-applied to streamed chunks after reload');
+  if (Math.abs(restored.camera[1] - -51) > 0.01) fail('player position was not restored');
+
+
   const finalStats = await page.evaluate(() => globalThis.__voxel.stats());
   console.log(`fps≈${finalStats.fps.toFixed(1)} (software rasteriser) · GPU pools ${finalStats.gpuMemoryMB.toFixed(0)} MB`);
+  // The software rasteriser is shared: stop the main page before loading the menus.
+  await page.close();
+
+  // UI: title screen, play, F3 overlay and pause menu.
+  const ui = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  ui.on('pageerror', (err) => errors.push(String(err)));
+  await ui.goto(`${url}?seed=2024&radius=3&offscreen=1&autostart=0&time=0.3`);
+  await ui.waitForFunction(() => globalThis.__game?.state === 'title', null, { timeout: 240_000, polling: 500 });
+  await ui.waitForFunction(() => document.querySelector('#title-status')?.textContent?.startsWith('World ready'), null, { timeout: 240_000, polling: 500 });
+  mkdirSync(outDir, { recursive: true });
+  await ui.screenshot({ path: join(outDir, 'ui-title.png') });
+  await ui.fill('#seed-input', 'portfolio');
+  await ui.click('#play');
+  await ui.waitForFunction(() => globalThis.__game.state !== 'title' && !globalThis.__game.busy, null, { timeout: 120_000 });
+  await ui.keyboard.press('F3');
+  const uiState = await ui.evaluate(() => ({
+    state: globalThis.__game.state,
+    seed: globalThis.__game.engine.options.seed,
+    statsVisible: !document.querySelector('#stats').hidden,
+    hudVisible: !document.querySelector('#hud').hidden,
+    slots: document.querySelectorAll('.hotbar-slot').length,
+  }));
+  // Pausing happens when the pointer lock is released (Esc); without one, open the menu directly.
+  if (await ui.evaluate(() => document.pointerLockElement !== null)) {
+    await ui.evaluate(() => document.exitPointerLock());
+    await ui.waitForFunction(() => globalThis.__game.state === 'paused', null, { timeout: 30_000 });
+  } else {
+    await ui.evaluate(() => globalThis.__game.setState('paused'));
+  }
+  await ui.waitForTimeout(600); // fade-in animation
+  await ui.screenshot({ path: join(outDir, 'ui-pause.png') });
+  console.log(`ui: ${JSON.stringify(uiState)}`);
+  if (!['playing', 'paused'].includes(uiState.state)) fail('Play did not start the game');
+  if (!uiState.statsVisible) fail('F3 did not show the debug overlay');
+  if (!uiState.hudVisible || uiState.slots !== 9) fail('HUD / hotbar missing');
+  // Reset World (two clicks) erases the local database and returns to the title screen.
+  await ui.evaluate(async () => { globalThis.__voxel.setBlock(0, 100, 0, 1); await globalThis.__game.save(false); });
+  await ui.click('#reset');
+  await ui.click('#reset');
+  await ui.waitForFunction(() => globalThis.__game.state === 'title' && !globalThis.__game.busy && globalThis.__game.engine, null, { timeout: 240_000, polling: 500 });
+  const reset = await ui.evaluate(async () => {
+    const db = await new Promise((res, rej) => { const r = indexedDB.open('webgpu-voxel-engine', 1); r.onsuccess = () => res(r.result); r.onerror = rej; });
+    const records = await new Promise((res) => { const r = db.transaction('world').objectStore('world').count(); r.onsuccess = () => res(r.result); });
+    db.close();
+    return { records, edits: globalThis.__voxel.engine.delta.editCount, toast: document.querySelector('#toast').textContent };
+  });
+  console.log(`reset world: ${JSON.stringify(reset)}`);
+  if (reset.records !== 0 || reset.edits !== 0) fail('Reset World did not erase the saved world');
+  await ui.close();
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));
 } finally {

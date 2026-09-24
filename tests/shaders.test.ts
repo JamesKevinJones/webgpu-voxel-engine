@@ -137,8 +137,8 @@ describe('shader modules', () => {
       const storage = (stripComments(source).match(/var<storage/g) ?? []).length;
       expect(storage, file).toBeLessThanOrEqual(8); // maxStorageBuffersPerShaderStage
     }
-    // mesh.wgsl: array<u32, 1024> in workgroup memory = 4 KiB (limit 16 KiB).
-    expect(meshSource).toMatch(/var<workgroup> runs: array<u32, 1024>/);
+    // mesh.wgsl: array<vec2<u32>, 1024> in workgroup memory = 8 KiB (limit 16 KiB).
+    expect(meshSource).toMatch(/var<workgroup> runs: array<vec2<u32>, 1024>/);
   });
 
   it('declare the Frame uniform with the layout FrameUniforms writes', () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { HOTBAR_BLOCKS, HotbarModel } from '../src/core/hotbar';
+import { HOTBAR_BLOCKS, HotbarModel, MAX_STACK, START_COUNTS, dropFor, itemName } from '../src/core/hotbar';
 import { CRACK_STAGE_COUNT, MiningState } from '../src/fx/mining';
 import { BlockType, breakTime } from '../src/world/block';
 
@@ -44,11 +44,45 @@ describe('mining progress', () => {
 });
 
 describe('hotbar', () => {
-  it('holds the nine requested blocks', () => {
+  it('holds nine items including torches and a water bucket', () => {
     expect(HOTBAR_BLOCKS).toEqual([
       BlockType.Stone, BlockType.Dirt, BlockType.Grass, BlockType.Sand, BlockType.Wood,
-      BlockType.Leaves, BlockType.Glass, BlockType.Cobblestone, BlockType.Brick,
+      BlockType.Glass, BlockType.Brick, BlockType.Torch, BlockType.Water,
     ]);
+    expect(START_COUNTS).toHaveLength(9);
+    expect(itemName(BlockType.Water)).toBe('Water Bucket');
+    expect(itemName(BlockType.Torch)).toBe('Torch');
+  });
+
+  it('consumes items when placing and collects drops when mining', () => {
+    const h = new HotbarModel();
+    h.select(7);
+    const torches = h.count;
+    expect(h.consume()).toBe(true);
+    expect(h.count).toBe(torches - 1);
+    expect(h.collect(BlockType.Torch)).toBe(7);
+    expect(h.count).toBe(torches);
+    expect(h.collect(BlockType.PineWood)).toBe(4);
+    expect(dropFor(BlockType.Cobblestone)).toBe(BlockType.Stone);
+    expect(h.collect(BlockType.Leaves)).toBe(-1);
+    h.counts[7] = 0;
+    expect(h.consume()).toBe(false);
+    h.counts[0] = MAX_STACK;
+    h.collect(BlockType.Stone);
+    expect(h.counts[0]).toBe(MAX_STACK);
+  });
+
+  it('saves and restores the selection and stacks', () => {
+    const h = new HotbarModel();
+    h.select(3);
+    h.consume();
+    const other = new HotbarModel();
+    other.load(h.save());
+    expect(other.selected).toBe(3);
+    expect(other.counts).toEqual(h.counts);
+    other.load({ selected: 99, counts: [-5, 1e9] });
+    expect(other.counts[0]).toBe(0);
+    expect(other.counts[1]).toBe(MAX_STACK);
   });
 
   it('selects slots with keys 1–9 and cycles with the wheel', () => {
@@ -57,7 +91,7 @@ describe('hotbar', () => {
     expect(HotbarModel.slotForKey('Digit0')).toBe(-1);
     expect(HotbarModel.slotForKey('KeyA')).toBe(-1);
     h.select(HotbarModel.slotForKey('Digit9'));
-    expect(h.block).toBe(BlockType.Brick);
+    expect(h.block).toBe(BlockType.Water);
     h.scroll(1);
     expect(h.selected).toBe(0);
     h.scroll(-1);

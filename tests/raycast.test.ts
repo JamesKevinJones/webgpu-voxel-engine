@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isSolid } from '../src/world/block';
+import { BlockType, isSolid, isTargetable } from '../src/world/block';
 import { raycastVoxels } from '../src/world/raycast';
 
 const world = (solid: Set<string>) => (x: number, y: number, z: number) => (solid.has(`${x},${y},${z}`) ? 1 : 0);
@@ -40,5 +40,12 @@ describe('raycastVoxels', () => {
     const hit = raycastVoxels(2.5, 2.5, 2.5, 0, 0, 1, 5, world(new Set(['2,2,2'])), isSolid)!;
     expect(hit.distance).toBe(0);
     expect([hit.nx, hit.ny, hit.nz]).toEqual([0, 0, 0]);
+  });
+
+  it('never targets air, water or ungenerated space', () => {
+    const unloadedAhead = (x: number) => (x >= 3 ? -1 : BlockType.Air);
+    expect(raycastVoxels(0.5, 0.5, 0.5, 1, 0, 0, 20, unloadedAhead, isTargetable)).toBeNull();
+    expect(isTargetable(BlockType.WaterFlow3)).toBe(false);
+    expect(isTargetable(BlockType.Torch)).toBe(true);
   });
 });

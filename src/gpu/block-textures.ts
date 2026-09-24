@@ -10,7 +10,7 @@ export const CRACK_STAGES = 10;
 export const TEXTURE_LAYERS = [
   'grass_top', 'grass_side', 'dirt', 'stone', 'sand', 'wood_side', 'wood_top', 'leaves', 'water', 'basalt', 'bedrock',
   'sandstone_side', 'sandstone_top', 'snow', 'ice', 'cactus_side', 'cactus_top', 'birch_side', 'pine_side',
-  'pine_leaves', 'glass', 'cobblestone', 'brick', 'tall_grass', 'red_flower', 'yellow_flower',
+  'pine_leaves', 'glass', 'cobblestone', 'brick', 'tall_grass', 'red_flower', 'yellow_flower', 'torch',
   'crack_0', 'crack_1', 'crack_2', 'crack_3', 'crack_4', 'crack_5', 'crack_6', 'crack_7', 'crack_8', 'crack_9',
 ] as const;
 export type TextureName = (typeof TEXTURE_LAYERS)[number];
@@ -43,6 +43,15 @@ export const BLOCK_TEXTURES: Readonly<Record<number, readonly [TextureName, Text
   [BlockType.TallGrass]: ['tall_grass', 'tall_grass', 'tall_grass'],
   [BlockType.RedFlower]: ['red_flower', 'red_flower', 'red_flower'],
   [BlockType.YellowFlower]: ['yellow_flower', 'yellow_flower', 'yellow_flower'],
+  [BlockType.Torch]: ['torch', 'torch', 'torch'],
+  [BlockType.WaterFlow1]: ['water', 'water', 'water'],
+  [BlockType.WaterFlow2]: ['water', 'water', 'water'],
+  [BlockType.WaterFlow3]: ['water', 'water', 'water'],
+  [BlockType.WaterFlow4]: ['water', 'water', 'water'],
+  [BlockType.WaterFlow5]: ['water', 'water', 'water'],
+  [BlockType.WaterFlow6]: ['water', 'water', 'water'],
+  [BlockType.WaterFlow7]: ['water', 'water', 'water'],
+  [BlockType.WaterFalling]: ['water', 'water', 'water'],
 };
 
 /**
@@ -258,6 +267,15 @@ export function texelRgba(layer: number, x: number, y: number): Rgba {
       if (centre) return [0.95, 0.85, 0.3, 1];
       if (petal) return name === 'red_flower' ? [0.85, 0.12, 0.1, 1] : [0.98, 0.85, 0.15, 1];
       if (stem || leaf) return [0.2, 0.5, 0.15, 1];
+      return [0, 0, 0, 0];
+    }
+    case 'torch': {
+      // A wooden stick with a glowing flame on top (drawn as crossed quads).
+      const flameD = Math.hypot((x - 7.5) * 1.3, y - 4.2);
+      if (flameD < 1.2) return [1, 0.97, 0.75, 1];
+      if (flameD < 2.3) return [1, 0.78, 0.25, 1];
+      if (flameD < 2.9 && y >= 3) return [0.95, 0.45, 0.1, 1];
+      if ((x === 7 || x === 8) && y >= 6) return [...shade(BARK, x === 7 ? 1.15 : 0.9), 1] as Rgba;
       return [0, 0, 0, 0];
     }
     default:

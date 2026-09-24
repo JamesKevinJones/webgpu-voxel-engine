@@ -42,9 +42,9 @@ function naiveFaceCount(padded: Uint8Array): number {
     for (let y = 0; y < CHUNK_SIZE; y++) {
       for (let x = 0; x < CHUNK_SIZE; x++) {
         const b = padded[paddedIndex(x + 1, y + 1, z + 1)]!;
-        for (const [dx, dy, dz] of FACE_NORMALS) {
-          if (isFaceVisible(b, padded[paddedIndex(x + 1 + dx!, y + 1 + dy!, z + 1 + dz!)]!)) n++;
-        }
+        FACE_NORMALS.forEach(([dx, dy, dz], dir) => {
+          if (isFaceVisible(b, padded[paddedIndex(x + 1 + dx, y + 1 + dy, z + 1 + dz)]!, dir)) n++;
+        });
       }
     }
   }
@@ -261,5 +261,81 @@ describe('greedy mesher', () => {
     const faces = naiveFaceCount(padded);
     expect(r.opaqueQuads + r.waterQuads).toBeGreaterThan(0);
     expect(r.opaqueQuads + r.waterQuads).toBeLessThan(faces);
+  });
+});
+
+describe('greedy mesher lighting', () => {
+  const floor = (_x: number, y: number) => (y === 0 ? BlockType.Stone : BlockType.Air);
+  const topQuads = (r: MeshResult) => {
+    const out: { verts: UnpackedVertex[]; light: number }[] = [];
+    for (let q = 0; q < r.opaqueQuads; q++) {
+      const verts = [0, 1, 2, 3].map((k) => unpackVertex(r.opaque[q * 4 + k]!, { x: 0, y: 0, z: 0, face: 0, ao: 0, block: 0 }));
+      if (verts[0]!.face === 2) out.push({ verts, light: r.opaqueLight[q]! });
+    }
+    return out;
+  };
+
+  it('stores one light word per quad and merges uniformly lit faces', () => {
+    const padded = volume(floor);
+    const light = new Uint8Array(PADDED_VOLUME).fill(0xf0);
+    const r = greedyMesh(padded, light);
+    expect(r.opaqueLight).toHaveLength(r.opaqueQuads);
+    expect(r.cutoutLight).toHaveLength(r.cutoutQuads);
+    const tops = topQuads(r);
+    expect(tops).toHaveLength(1);
+    expect(tops[0]!.light).toBe(0xf0f0f0f0);
+  });
+
+  it('smooths light per corner and splits quads where light changes', () => {
+    const padded = volume(floor);
+    // Block light 15 at x < 16 and 5 beyond, sky 0 everywhere.
+    const light = volume((x) => (x < 16 ? 15 : 5));
+    const r = greedyMesh(padded, light);
+    const tops = topQuads(r);
+    expect(tops.length).toBeGreaterThan(1);
+    const bytes = (w: number) => [0, 1, 2, 3].map((k) => (w >>> (k * 8)) & 0xff);
+    for (const { verts, light: word } of tops) {
+      bytes(word).forEach((b, k) => {
+        const v = verts[k]!;
+        // Corners at x = 16 see two voxels of each side: mean of 15 and 5 = 10.
+        const expected = v.x < 16 ? 15 : v.x === 16 ? 10 : 5;
+        expect(b >> 4, 'sky').toBe(0);
+        expect(b & 15, `block light at x=${v.x}`).toBe(expected);
+      });
+    }
+  });
+
+  it('gives cross plants and torches the light of their own voxel', () => {
+    const padded = volume((x, y, z) => (y === 0 ? BlockType.Stone : x === 4 && y === 1 && z === 4 ? BlockType.Torch : BlockType.Air));
+    const light = volume((x, y, z) => (x === 4 && y === 1 && z === 4 ? 0x3e : 0));
+    const r = greedyMesh(padded, light);
+    expect(r.cutoutQuads).toBe(2);
+    expect([...r.cutoutLight]).toEqual([0x3e3e3e3e, 0x3e3e3e3e]);
+  });
+});
+
+describe('flowing water faces', () => {
+  it('draws the step between a source and lower flowing water, but not the reverse', () => {
+    expect(isFaceVisible(BlockType.Water, BlockType.WaterFlow2, 0)).toBe(true);
+    expect(isFaceVisible(BlockType.WaterFlow2, BlockType.Water, 1)).toBe(false);
+    expect(isFaceVisible(BlockType.WaterFlow1, BlockType.WaterFlow3, 4)).toBe(true);
+    expect(isFaceVisible(BlockType.WaterFlow3, BlockType.WaterFlow3, 4)).toBe(false);
+    // Never between vertically stacked water.
+    expect(isFaceVisible(BlockType.Water, BlockType.WaterFlow7, 3)).toBe(false);
+    expect(isFaceVisible(BlockType.WaterFalling, BlockType.WaterFlow4, 0)).toBe(true);
+  });
+
+  it('shows the lowered top of flowing water under a solid block, never of a full source', () => {
+    expect(isFaceVisible(BlockType.WaterFlow3, BlockType.Stone, 2)).toBe(true);
+    expect(isFaceVisible(BlockType.Water, BlockType.Stone, 2)).toBe(false);
+    expect(isFaceVisible(BlockType.WaterFlow3, BlockType.Stone, 0)).toBe(false);
+  });
+
+  it('meshes a flowing stream into the water pool', () => {
+    const padded = volume((x, y) => (y === 0 ? BlockType.Stone : y === 1 && x < 8 ? (x === 0 ? BlockType.Water : BlockType.WaterFlow1 + x - 1) : BlockType.Air));
+    const r = greedyMesh(padded);
+    checkMeshInvariants(padded, r);
+    const blocks = new Set(quads(r).filter((q) => q[0]!.face < 6 && r.water.length > 0).map((q) => q[0]!.block));
+    for (let level = 1; level <= 7; level++) expect(blocks.has(BlockType.WaterFlow1 + level - 1)).toBe(true);
   });
 });

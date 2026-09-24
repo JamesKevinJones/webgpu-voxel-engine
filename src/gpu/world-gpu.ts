@@ -1,17 +1,21 @@
 import { createShaderModule } from '../core/gpu-context';
 import { CHUNK_SIZE } from '../world/coords';
 import type { GenerationJob, MeshJob } from '../world/chunk-manager';
+import { buildPaddedLight } from '../world/lighting';
 import {
   INDIRECT_ARGS_BYTES,
   INDIRECT_ARGS_WORDS,
+  CUTOUT_SLOT_WORDS,
   CUTOUT_VERTEX_CAPACITY,
   MESH_COUNTER_WORDS,
   MESH_JOB_NEIGHBOR_OFFSET,
   MESH_JOB_WORDS,
   OPAQUE_QUAD_CAPACITY,
+  OPAQUE_SLOT_WORDS,
   OPAQUE_VERTEX_CAPACITY,
   PADDED_WORDS,
   QUAD_INDEX_PATTERN,
+  WATER_SLOT_WORDS,
   WATER_VERTEX_CAPACITY,
 } from '../world/mesh-format';
 import { GPU_DATA_WORDS, GPU_SLOT_WORDS, type PalettedChunk } from '../world/palette-chunk';
@@ -21,16 +25,18 @@ import worldgenSource from '../shaders/worldgen.wgsl';
 import { withPrelude } from './shader-prelude';
 
 export const VOXEL_SLOT_BYTES = GPU_SLOT_WORDS * 4;
-export const OPAQUE_SLOT_BYTES = OPAQUE_VERTEX_CAPACITY * 4;
-export const WATER_SLOT_BYTES = WATER_VERTEX_CAPACITY * 4;
-export const CUTOUT_SLOT_BYTES = CUTOUT_VERTEX_CAPACITY * 4;
+/** Bytes per mesh slot in each pool: vertices plus one light word per quad. */
+export const OPAQUE_SLOT_BYTES = OPAQUE_SLOT_WORDS * 4;
+export const WATER_SLOT_BYTES = WATER_SLOT_WORDS * 4;
+export const CUTOUT_SLOT_BYTES = CUTOUT_SLOT_WORDS * 4;
 /** Number of vertex pools (opaque, water, cutout) and indirect records per mesh slot. */
 export const MESH_POOL_COUNT = 3;
 /** Byte offset of a slot's drawIndexedIndirect record for `pool` in `indirectArgs`. */
 export function indirectOffset(slot: number, pool: number): number {
   return (slot * MESH_POOL_COUNT + pool) * INDIRECT_ARGS_BYTES;
 }
-const POOL_VERTEX_CAPACITY = [OPAQUE_VERTEX_CAPACITY, WATER_VERTEX_CAPACITY, CUTOUT_VERTEX_CAPACITY] as const;
+export const POOL_VERTEX_CAPACITY = [OPAQUE_VERTEX_CAPACITY, WATER_VERTEX_CAPACITY, CUTOUT_VERTEX_CAPACITY] as const;
+const PADDED_BYTES = PADDED_WORDS * 4;
 /** One invocation per data word (4 voxels at 8 bits), 64 invocations per workgroup → 128 workgroups per chunk. */
 const GEN_WORKGROUPS_PER_CHUNK = GPU_DATA_WORDS / 64;
 const GATHER_WORKGROUPS = Math.ceil(PADDED_WORDS / 64);
@@ -73,6 +79,8 @@ export class WorldGpu {
   readonly chunkOrigins: GPUBuffer;
   readonly indexBuffer: GPUBuffer;
   private readonly padded: GPUBuffer;
+  private readonly paddedLight: GPUBuffer;
+  private readonly lightScratch = new Uint8Array(PADDED_BYTES);
   private readonly genParams: GPUBuffer;
   private readonly genJobs: GPUBuffer;
   private readonly meshJobs: GPUBuffer;
@@ -114,7 +122,12 @@ export class WorldGpu {
       usage: storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
     this.chunkOrigins = device.createBuffer({ label: 'chunk origins', size: meshSlots * 16, usage: storage | GPUBufferUsage.COPY_DST });
-    this.padded = device.createBuffer({ label: 'padded voxel scratch', size: maxMeshJobs * PADDED_WORDS * 4, usage: storage });
+    this.padded = device.createBuffer({ label: 'padded voxel scratch', size: maxMeshJobs * PADDED_BYTES, usage: storage });
+    this.paddedLight = device.createBuffer({
+      label: 'padded light volumes',
+      size: maxMeshJobs * PADDED_BYTES,
+      usage: storage | GPUBufferUsage.COPY_DST,
+    });
     this.genParams = device.createBuffer({ label: 'worldgen params', size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.genJobs = device.createBuffer({ label: 'worldgen jobs', size: maxGenJobs * 16, usage: storage | GPUBufferUsage.COPY_DST });
     this.meshJobs = device.createBuffer({ label: 'mesh jobs', size: maxMeshJobs * MESH_JOB_WORDS * 4, usage: storage | GPUBufferUsage.COPY_DST });
@@ -171,6 +184,7 @@ export class WorldGpu {
         { binding: 4, resource: { buffer: this.cutoutVertices } },
         { binding: 5, resource: { buffer: this.indirectArgs } },
         { binding: 6, resource: { buffer: this.counters } },
+        { binding: 7, resource: { buffer: this.paddedLight } },
       ],
     });
   }
@@ -184,7 +198,9 @@ export class WorldGpu {
     const [genPipeline, gatherPipeline, meshPipeline] = await Promise.all([
       device.createComputePipelineAsync({ label: 'worldgen', layout: 'auto', compute: { module: genModule, entryPoint: 'main' } }),
       device.createComputePipelineAsync({ label: 'gather', layout: 'auto', compute: { module: gatherModule, entryPoint: 'main' } }),
-      device.createComputePipelineAsync({ label: 'greedy mesh', layout: 'auto', compute: { module: meshModule, entryPoint: 'main' } }),
+      device.createComputePipelineAsync({
+        label: 'greedy mesh', layout: 'auto', compute: { module: meshModule, entryPoint: 'main', constants: { MESH_SLOTS: config.meshSlots } },
+      }),
     ]);
     return new WorldGpu(device, config, genPipeline, gatherPipeline, meshPipeline);
   }
@@ -192,7 +208,7 @@ export class WorldGpu {
   /** Bytes allocated for all pools (for the stats overlay). */
   get allocatedBytes(): number {
     return this.voxelPool.size + this.opaqueVertices.size + this.waterVertices.size + this.cutoutVertices.size +
-      this.indirectArgs.size + this.counters.size + this.chunkOrigins.size + this.padded.size + this.indexBuffer.size;
+      this.indirectArgs.size + this.counters.size + this.chunkOrigins.size + this.padded.size + this.paddedLight.size + this.indexBuffer.size;
   }
 
   /**
@@ -245,6 +261,8 @@ export class WorldGpu {
       queue.writeBuffer(this.counters, slot * MESH_COUNTER_WORDS * 4, this.counterReset);
       this.originData.set([job.record.cx * CHUNK_SIZE, job.record.cy * CHUNK_SIZE, job.record.cz * CHUNK_SIZE, 0]);
       queue.writeBuffer(this.chunkOrigins, slot * 16, this.originData);
+      buildPaddedLight(job.neighborLight, this.lightScratch);
+      queue.writeBuffer(this.paddedLight, i * PADDED_BYTES, this.lightScratch);
     });
     queue.writeBuffer(this.meshJobs, 0, jobData, 0, jobs.length * MESH_JOB_WORDS);
 
@@ -275,7 +293,7 @@ export class WorldGpu {
 
   destroy(): void {
     for (const b of [this.voxelPool, this.opaqueVertices, this.waterVertices, this.cutoutVertices, this.indirectArgs, this.counters,
-      this.chunkOrigins, this.indexBuffer, this.padded, this.genParams, this.genJobs, this.meshJobs]) {
+      this.chunkOrigins, this.indexBuffer, this.padded, this.paddedLight, this.genParams, this.genJobs, this.meshJobs]) {
       b.destroy();
     }
   }

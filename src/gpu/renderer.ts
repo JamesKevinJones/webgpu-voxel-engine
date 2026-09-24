@@ -75,7 +75,14 @@ export class Renderer {
     private readonly overlayBuffer: GPUBuffer,
     readonly particleBuffer: GPUBuffer,
     private readonly simBuffer: GPUBuffer,
+    private readonly textures: GPUTexture[],
   ) {}
+
+  /** Releases the renderer's own GPU resources (the world pools belong to WorldGpu). */
+  destroy(): void {
+    for (const b of [this.overlayBuffer, this.particleBuffer, this.simBuffer]) b.destroy();
+    for (const t of this.textures) t.destroy();
+  }
 
   static async create(device: GPUDevice, format: GPUTextureFormat, world: WorldGpu, frameUniforms: GPUBuffer): Promise<Renderer> {
     const [skyModule, terrainModule, shadowModule, overlayModule, particleModule] = await Promise.all([
@@ -162,7 +169,10 @@ export class Renderer {
       layout = terrainPipelineLayout, depthWrite = true) => device.createRenderPipelineAsync({
       label,
       layout,
-      vertex: { module: terrainModule, entryPoint: 'vs_main', constants: { VERTEX_CAPACITY: capacity } },
+      vertex: {
+        module: terrainModule, entryPoint: 'vs_main',
+        constants: { VERTEX_CAPACITY: capacity, LIGHT_OFFSET: capacity * world.config.meshSlots },
+      },
       fragment: { module: terrainModule, entryPoint: fragment, targets: [{ format, ...(blend ? { blend } : {}) }] },
       primitive: { topology: 'triangle-list', cullMode: cull, frontFace: 'ccw' },
       depthStencil: { format: depthFormat, depthWriteEnabled: depthWrite, depthCompare: 'less' },
@@ -272,7 +282,7 @@ export class Renderer {
     return new Renderer(
       device, world,
       { sky: sky!, opaque: opaque!, cutout: cutout!, water: water!, shadow: [shadow0!, shadow1!], box: box!, crack: crack!, particles: particles!, simulate },
-      groups, depthLayout, shadowViews, overlayBuffer, particleBuffer, simBuffer,
+      groups, depthLayout, shadowViews, overlayBuffer, particleBuffer, simBuffer, [blocks.texture, shadowTexture],
     );
   }
 

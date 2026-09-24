@@ -1,6 +1,7 @@
 import { intersectsSolid } from '../physics/aabb';
 import { isOpaque } from '../world/block';
 import { CHUNK_SIZE, chunkKey, worldToChunk } from '../world/coords';
+import { buildPaddedLight } from '../world/lighting';
 import { buildPaddedVolume, greedyMesh, type VoxelSource } from '../world/mesher';
 import { climateAt, generateChunkDense, surfaceHeight } from '../world/terrain';
 import type { Engine } from './engine';
@@ -17,12 +18,18 @@ export interface ParityReport {
 export interface VoxelDebugApi {
   engine: Engine;
   stats(): EngineStats;
-  /** True when nothing is queued for generation or meshing and no readback is pending. */
+  /** True when nothing is queued for generation, lighting, water or meshing and no readback is pending. */
   settled(): boolean;
   /** Compares GPU results against the CPU reference implementations. */
   parity(maxChunks?: number): ParityReport;
   teleport(x: number, y: number, z: number, yaw?: number, pitch?: number): void;
+  /** Edits a voxel like the player would (recorded for saving, wakes the water simulation). */
   setBlock(x: number, y: number, z: number, block: number): boolean;
+  /** Places the selected hotbar item at a voxel (consumes it). */
+  place(x: number, y: number, z: number): boolean;
+  block(x: number, y: number, z: number): number;
+  /** Light byte at a voxel: { sky, block }. */
+  light(x: number, y: number, z: number): { sky: number; block: number };
   /** Height of the topmost opaque voxel of a loaded column, or null. */
   surfaceAt(x: number, z: number): number | null;
   /** Switches between 'freecam' and 'walk' (physics) mode. */
@@ -77,7 +84,7 @@ export function runParityCheck(engine: Engine, maxChunks = 32): ParityReport {
       }
     }
     if (!complete) continue;
-    const cpu = greedyMesh(buildPaddedVolume(neighbors));
+    const cpu = greedyMesh(buildPaddedVolume(neighbors), buildPaddedLight(chunks.neighborLight(record)));
     report.meshesCompared++;
     if (cpu.opaqueQuads !== record.opaqueQuads || cpu.waterQuads !== record.waterQuads || cpu.cutoutQuads !== record.cutoutQuads) {
       report.meshMismatches.push({
@@ -100,6 +107,7 @@ export function installDebugApi(engine: Engine): VoxelDebugApi {
       if (c.x !== worldToChunk(p[0]!) || c.z !== worldToChunk(p[2]!)) return false;
       const s = engine.chunks.countByState();
       return s.pending === 0 && s.generating === 0 && engine.chunks.meshQueueSize === 0 &&
+        engine.chunks.lightQueueSize === 0 && engine.fluids.queued === 0 &&
         [...engine.chunks.drawable()].every((r) => r.opaqueQuads >= 0);
     },
     parity: (maxChunks) => runParityCheck(engine, maxChunks),
@@ -111,7 +119,13 @@ export function installDebugApi(engine: Engine): VoxelDebugApi {
       if (yaw !== undefined) engine.camera.yaw = yaw;
       if (pitch !== undefined) engine.camera.setPitch(pitch);
     },
-    setBlock: (x, y, z, block) => engine.chunks.setBlock(x, y, z, block),
+    setBlock: (x, y, z, block) => engine.editBlock(x, y, z, block),
+    place: (x, y, z) => engine.placeAt(x, y, z),
+    block: (x, y, z) => engine.chunks.getBlock(x, y, z),
+    light: (x, y, z) => {
+      const l = engine.chunks.getLight(x, y, z);
+      return { sky: l >> 4, block: l & 15 };
+    },
     surfaceAt: (x, z) => {
       const top = (engine.chunks.config.maxChunkY + 1) * CHUNK_SIZE - 1;
       const bottom = engine.chunks.config.minChunkY * CHUNK_SIZE;

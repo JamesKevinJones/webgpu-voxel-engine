@@ -52,6 +52,15 @@ export const INDICES_PER_QUAD = 6;
 /** Static quad index pattern; the flip for AO anisotropy is done by rotating vertices instead. */
 export const QUAD_INDEX_PATTERN: readonly number[] = [0, 1, 2, 0, 2, 3];
 
+/**
+ * Per-quad light word (one u32 per quad, stored after all vertices of a pool: pool word
+ * `meshSlots * VERTEX_CAPACITY + slot * QUAD_CAPACITY + quad`): byte k is the smoothed light of
+ * vertex k, skylight in the high nibble and block light in the low nibble.
+ */
+export function packQuadLight(l0: number, l1: number, l2: number, l3: number): number {
+  return (l0 | (l1 << 8) | (l2 << 16) | (l3 << 24)) >>> 0;
+}
+
 /** Per-chunk quad budgets of the fixed-size GPU mesh slots. */
 export const OPAQUE_QUAD_CAPACITY = 6144;
 export const WATER_QUAD_CAPACITY = 1024;
@@ -69,6 +78,11 @@ export const PADDED_WORDS = Math.ceil(PADDED_VOLUME / 4);
 export function paddedIndex(px: number, py: number, pz: number): number {
   return px + PADDED_SIZE * (py + PADDED_SIZE * pz);
 }
+
+/** Pool words per mesh slot: packed vertices plus one light word per quad. */
+export const OPAQUE_SLOT_WORDS = OPAQUE_VERTEX_CAPACITY + OPAQUE_QUAD_CAPACITY;
+export const WATER_SLOT_WORDS = WATER_VERTEX_CAPACITY + WATER_QUAD_CAPACITY;
+export const CUTOUT_SLOT_WORDS = CUTOUT_VERTEX_CAPACITY + CUTOUT_QUAD_CAPACITY;
 
 /** Mesh job record (u32 words): [0] mesh slot, [1..3] reserved, [4..31) voxel slots of the 27 neighbours. */
 export const MESH_JOB_WORDS = 32;

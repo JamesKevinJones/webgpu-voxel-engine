@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BlockType, isOpaque } from '../src/world/block';
+import { BlockType, isOpaque, isWater } from '../src/world/block';
 import { CHUNK_SIZE, localIndex } from '../src/world/coords';
 import {
   BEACH_MAX_Y,
@@ -303,7 +303,9 @@ describe('trees and plants', () => {
       }
     }
     for (const [x, z] of columns(3000, 4000)) add(x, surfaceHeight(x, z, seed) + 1, z);
-    const natural = Object.values(BlockType).filter((b) => b !== BlockType.Glass && b !== BlockType.Cobblestone && b !== BlockType.Brick);
+    // Crafted blocks and dynamic water (flowing / falling only appears through the fluid simulation).
+    const natural = Object.values(BlockType).filter((b) => b !== BlockType.Glass && b !== BlockType.Cobblestone && b !== BlockType.Brick &&
+      b !== BlockType.Torch && (b === BlockType.Water || !isWater(b)));
     for (const b of natural) expect(seen.has(b), `block ${b}`).toBe(true);
   });
 });

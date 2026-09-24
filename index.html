@@ -3,14 +3,82 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WebGPU Voxel Engine</title>
+    <meta name="description" content="A voxel sandbox rendered entirely with WebGPU: GPU world generation, compute greedy meshing, flood-fill lighting, flowing water and cascaded shadows." />
+    <meta name="theme-color" content="#0b0f14" />
+    <title>Voxel Frontier · WebGPU</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%2362b35a' d='M16 2 29 9 16 16 3 9z'/%3E%3Cpath fill='%237a5534' d='M3 9l13 7v14L3 23z'/%3E%3Cpath fill='%235c3f27' d='M29 9 16 16v14l13-7z'/%3E%3C/svg%3E" />
   </head>
-  <body>
+  <body data-state="loading">
     <canvas id="viewport"></canvas>
-    <div id="crosshair"></div>
-    <div id="stats"></div>
-    <div id="hotbar"></div>
-    <div id="hint">Click to look · WASD move · Space jump/up · Q down · Shift sprint · V walk/fly · T pause time · [ ] hour · G shadows · hold LMB mine · RMB place · 1–9 / wheel hotbar</div>
+
+    <div id="hud" hidden>
+      <div id="crosshair" aria-hidden="true"></div>
+      <div id="hotbar"></div>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="stats" hidden></div>
+
+    <section id="title" class="screen" hidden>
+      <div class="panel title-panel">
+        <p class="eyebrow">WebGPU voxel sandbox</p>
+        <h1>Voxel <span>Frontier</span></h1>
+        <p class="tagline">Endless procedural terrain generated, meshed and lit on your GPU.</p>
+        <div class="seed-row">
+          <label for="seed-input">World seed</label>
+          <div class="seed-field">
+            <input id="seed-input" type="text" inputmode="text" autocomplete="off" spellcheck="false" maxlength="32" />
+            <button id="random-seed" class="icon-button" type="button" title="Random seed" aria-label="Random seed">⟳</button>
+          </div>
+        </div>
+        <button id="play" class="primary" type="button">Click to Play</button>
+        <div class="progress" aria-hidden="true"><div id="title-progress"></div></div>
+        <p id="title-status" class="status">Starting WebGPU…</p>
+        <div class="controls" aria-label="Controls">
+          <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd><span>Move</span></div>
+          <div><kbd>Mouse</kbd><span>Look</span></div>
+          <div><kbd>Space</kbd><span>Jump / swim up</span></div>
+          <div><kbd>Shift</kbd><span>Sprint</span></div>
+          <div><kbd>LMB</kbd><span>Hold to mine</span></div>
+          <div><kbd>RMB</kbd><span>Place block</span></div>
+          <div><kbd>1</kbd>–<kbd>9</kbd><kbd>Wheel</kbd><span>Hotbar</span></div>
+          <div><kbd>V</kbd><span>Walk / fly</span></div>
+          <div><kbd>Q</kbd><span>Fly down</span></div>
+          <div><kbd>T</kbd><kbd>[</kbd><kbd>]</kbd><span>Time of day</span></div>
+          <div><kbd>G</kbd><span>Shadows</span></div>
+          <div><kbd>F3</kbd><span>Debug overlay</span></div>
+          <div><kbd>Esc</kbd><span>Pause &amp; settings</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="pause" class="screen" hidden>
+      <div class="panel pause-panel">
+        <h2>Paused</h2>
+        <button id="resume" class="primary" type="button">Resume</button>
+        <p id="pause-note" class="note"></p>
+        <div class="info-row">
+          <span>Seed <code id="seed-display"></code></span>
+          <span id="save-state" class="muted"></span>
+        </div>
+        <fieldset>
+          <legend>Audio</legend>
+          <label class="setting"><span>Volume</span><input id="set-volume" type="range" /><output id="volume-value"></output></label>
+        </fieldset>
+        <fieldset>
+          <legend>Video</legend>
+          <label class="setting"><span>Field of view</span><input id="set-fov" type="range" /><output id="fov-value"></output></label>
+          <label class="setting"><span>Render distance</span><input id="set-distance" type="range" /><output id="distance-value"></output></label>
+          <p id="distance-note" class="note"></p>
+          <label class="setting"><span>Fog density</span><input id="set-fog" type="range" /><output id="fog-value"></output></label>
+          <label class="setting toggle"><span>Shadows</span><input id="set-shadows" type="checkbox" /><span class="switch" aria-hidden="true"></span></label>
+        </fieldset>
+        <div class="button-row">
+          <button id="quit" type="button">Save &amp; quit to title</button>
+          <button id="reset" class="danger" type="button">Reset World</button>
+        </div>
+      </div>
+    </section>
+
     <div id="error" hidden>
       <h2></h2>
       <p></p>

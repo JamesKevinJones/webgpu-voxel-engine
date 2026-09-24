@@ -5,6 +5,10 @@ export interface EngineStats {
   chunksPending: number;
   chunksGenerating: number;
   meshQueue: number;
+  /** Generated chunks waiting for their initial lighting. */
+  lightQueue: number;
+  /** Cells scheduled in the water simulation. */
+  fluidCells: number;
   meshedChunks: number;
   visibleChunks: number;
   vertices: number;
@@ -25,44 +29,56 @@ export interface EngineStats {
   target: string;
   placeBlock: string;
   biome: string;
+  /** Voxel light at the camera. */
+  light: string;
   mining: string;
   particles: number;
   shadows: string;
+  /** Saved voxel edits. */
+  edits: number;
   seed: number;
 }
 
 const fmt = new Intl.NumberFormat('en-US');
 
-/** Lightweight DOM overlay; refreshed a few times per second to keep layout work negligible. */
+/**
+ * F3 debug overlay (lightweight DOM, refreshed a few times per second to keep layout work
+ * negligible). Hidden by default; `visible` toggles it.
+ */
 export class StatsOverlay {
   private readonly rows = new Map<string, HTMLElement>();
   private lastUpdate = -Infinity;
+  private shown = false;
 
-  constructor(root: HTMLElement, private readonly intervalMs = 200) {
+  constructor(private readonly root: HTMLElement, private readonly intervalMs = 200) {
+    root.replaceChildren();
     root.classList.add('stats');
+    root.hidden = true;
     const layout: [string, string][] = [
       ['fps', 'FPS'],
+      ['frame', 'Frame time'],
+      ['chunks', 'Active chunks'],
+      ['triangles', 'Triangles'],
+      ['position', 'XYZ'],
+      ['biome', 'Biome'],
       ['mode', 'Mode'],
       ['grounded', 'Player'],
       ['time', 'Time of day'],
-      ['biome', 'Biome'],
+      ['light', 'Light'],
       ['shadows', 'Shadows'],
-      ['frame', 'Frame'],
-      ['chunks', 'Chunks'],
       ['streaming', 'Streaming'],
       ['meshed', 'Meshed / visible'],
       ['vertices', 'Vertices'],
-      ['triangles', 'Triangles'],
       ['slots', 'GPU slots'],
       ['memory', 'Memory'],
-      ['position', 'Position'],
       ['chunk', 'Chunk'],
       ['look', 'Yaw / pitch'],
       ['speed', 'Speed'],
       ['target', 'Target'],
-      ['place', 'Place block'],
+      ['place', 'Holding'],
       ['mining', 'Mining'],
       ['particles', 'Particles'],
+      ['world', 'World'],
     ];
     for (const [key, label] of layout) {
       const row = document.createElement('div');
@@ -78,16 +94,28 @@ export class StatsOverlay {
     }
   }
 
+  get visible(): boolean {
+    return this.shown;
+  }
+
+  set visible(v: boolean) {
+    this.shown = v;
+    this.root.hidden = !v;
+    this.lastUpdate = -Infinity;
+  }
+
   update(s: EngineStats, now: number): void {
-    if (now - this.lastUpdate < this.intervalMs) return;
+    if (!this.shown || now - this.lastUpdate < this.intervalMs) return;
     this.lastUpdate = now;
     this.set('fps', s.fps.toFixed(0));
     this.set('mode', s.mode);
     this.set('grounded', s.grounded);
     this.set('time', s.timeOfDay);
     this.set('frame', `${s.frameMs.toFixed(2)} ms`);
-    this.set('chunks', `${fmt.format(s.chunksLoaded)} ready`);
-    this.set('streaming', `${s.chunksPending} queued · ${s.chunksGenerating} gen · ${s.meshQueue} mesh`);
+    this.set('chunks', `${fmt.format(s.chunksLoaded)} loaded · ${fmt.format(s.meshedChunks)} meshed`);
+    this.set('streaming', `${s.chunksPending} queued · ${s.chunksGenerating} gen · ${s.lightQueue} light · ${s.meshQueue} mesh`);
+    this.set('light', s.light);
+    this.set('world', `seed ${s.seed} · ${fmt.format(s.edits)} edits · ${fmt.format(s.fluidCells)} water cells`);
     this.set('meshed', `${s.meshedChunks} / ${s.visibleChunks}${s.overflowChunks ? ` (${s.overflowChunks} overflow)` : ''}`);
     this.set('vertices', fmt.format(s.vertices));
     this.set('triangles', fmt.format(s.triangles));

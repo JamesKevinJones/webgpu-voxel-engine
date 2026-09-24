@@ -19,6 +19,7 @@ function generateAll(m: ChunkManager, make: (job: GenerationJob) => PalettedChun
     for (const job of jobs) expect(m.completeGeneration(job, make(job))).toBe(true);
     all.push(...jobs);
   }
+  m.processLighting();
   return all;
 }
 
@@ -69,6 +70,7 @@ describe('ChunkManager streaming', () => {
     m.updateCenter(0, 0, 0);
     const [center] = m.nextGenerationBatch(1);
     m.completeGeneration(center!, SOLID());
+    m.processLighting();
     expect(m.nextMeshBatch(10)).toHaveLength(0); // neighbours still pending
     generateAll(m);
     const jobs = m.nextMeshBatch(10);

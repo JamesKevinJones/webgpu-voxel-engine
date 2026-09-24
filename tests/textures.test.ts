@@ -14,7 +14,7 @@ import {
 import { SHADER_CONSTANTS } from '../src/gpu/shader-prelude';
 import { BLOCK_TYPE_COUNT } from '../src/world/block';
 
-const ALPHA_LAYERS = new Set<string>(['glass', 'tall_grass', 'red_flower', 'yellow_flower', 'grass_side',
+const ALPHA_LAYERS = new Set<string>(['glass', 'tall_grass', 'red_flower', 'yellow_flower', 'torch', 'grass_side',
   ...Array.from({ length: CRACK_STAGES }, (_, i) => `crack_${i}`)]);
 
 describe('block textures', () => {

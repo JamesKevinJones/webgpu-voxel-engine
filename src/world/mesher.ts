@@ -1,12 +1,16 @@
-import { BlockType, isCrossPlant, isFaceVisible, isOpaque, renderClass } from './block';
+import { BlockType, isCrossPlant, isFaceVisible, isOpaque, isWater, renderClass } from './block';
 import { CHUNK_SIZE, SELF_NEIGHBOR_INDEX, resolveNeighbor, neighborIndex, type NeighborLocation } from './coords';
 import {
   FACE_COUNT,
   PADDED_SIZE,
   PADDED_VOLUME,
+  packQuadLight,
   packVertex,
   paddedIndex,
 } from './mesh-format';
+
+/** Light byte of fully sky-lit voxels (see lighting.ts); the default when no light volume is given. */
+const OPEN_SKY_LIGHT = 0xf0;
 
 /** Minimal voxel source interface (PalettedChunk satisfies it). */
 export interface VoxelSource {
@@ -46,6 +50,10 @@ export interface MeshResult {
   water: Uint32Array;
   /** Alpha-tested geometry: glass faces and cross-plant quads. */
   cutout: Uint32Array;
+  /** One light word per quad (see `packQuadLight`), parallel to the vertex arrays. */
+  opaqueLight: Uint32Array;
+  waterLight: Uint32Array;
+  cutoutLight: Uint32Array;
   opaqueQuads: number;
   waterQuads: number;
   cutoutQuads: number;
@@ -55,22 +63,36 @@ export interface MeshResult {
 const KEY_AO_SHIFT = 5;
 const AO_OPEN_KEY = 0xff << KEY_AO_SHIFT;
 
+interface Pools {
+  opaque: number[];
+  water: number[];
+  cutout: number[];
+  opaqueLight: number[];
+  waterLight: number[];
+  cutoutLight: number[];
+}
+
+function roundedMean(sum: number, n: number): number {
+  return Math.floor((sum * 2 + n) / (n * 2));
+}
+
 /**
  * CPU reference implementation of the GPU greedy mesher (`mesh.wgsl`), same algorithm:
  *  1. For every face direction and slice, compute a 32×32 mask of face keys
- *     (block id + 4 corner AO levels; faces merge only when keys match exactly).
+ *     (block id + 4 corner AO levels + 4 smoothed corner light bytes; faces merge only when keys
+ *     match exactly).
  *  2. Per row, collapse the mask into maximal runs of identical keys.
  *  3. Per run-start column, merge vertically adjacent runs with identical start/length/key.
+ * `light` is the padded light volume (see `buildPaddedLight`); without it everything is sky-lit.
  */
-export function greedyMesh(padded: Uint8Array): MeshResult {
-  const opaque: number[] = [];
-  const water: number[] = [];
-  const cutout: number[] = [];
-  const pools = { opaque, water, cutout };
+export function greedyMesh(padded: Uint8Array, light?: Uint8Array): MeshResult {
+  const pools: Pools = { opaque: [], water: [], cutout: [], opaqueLight: [], waterLight: [], cutoutLight: [] };
   const runs = new Uint32Array(CHUNK_SIZE * CHUNK_SIZE);
+  const runLight = new Uint32Array(CHUNK_SIZE * CHUNK_SIZE);
   const p = [0, 0, 0];
   const q = [0, 0, 0];
   const sample = (x: number, y: number, z: number): number => padded[paddedIndex(x + 1, y + 1, z + 1)]!;
+  const sampleLight = (x: number, y: number, z: number): number => (light ? light[paddedIndex(x + 1, y + 1, z + 1)]! : OPEN_SKY_LIGHT);
   const occ = (x: number, y: number, z: number): number => (isOpaque(sample(x, y, z)) ? 1 : 0);
 
   for (let dir = 0; dir < FACE_COUNT; dir++) {
@@ -81,24 +103,32 @@ export function greedyMesh(padded: Uint8Array): MeshResult {
     for (let s = 0; s < CHUNK_SIZE; s++) {
       // Phase 1: row runs.
       runs.fill(0);
+      runLight.fill(0);
       for (let j = 0; j < CHUNK_SIZE; j++) {
         let runKey = 0;
+        let runKeyLight = 0;
         let runStart = 0;
         for (let i = 0; i <= CHUNK_SIZE; i++) {
           let key = 0;
+          let keyLight = 0;
           if (i < CHUNK_SIZE) {
             p[a] = s; p[u] = i; p[v] = j;
             const block = sample(p[0]!, p[1]!, p[2]!);
             q[0] = p[0]!; q[1] = p[1]!; q[2] = p[2]!;
             q[a] = q[a]! + sign;
             const neighbor = sample(q[0]!, q[1]!, q[2]!);
-            if (isFaceVisible(block, neighbor)) {
-              key = block | (block === BlockType.Water ? AO_OPEN_KEY : aoKey(q, u, v, occ));
+            if (block !== BlockType.Air && isFaceVisible(block, neighbor, dir)) {
+              key = block | (isWater(block) ? AO_OPEN_KEY : aoKey(q, u, v, occ));
+              keyLight = lightKey(q, u, v, occ, sampleLight);
             }
           }
-          if (key !== runKey) {
-            if (runKey !== 0) runs[j * CHUNK_SIZE + runStart] = runKey | ((i - runStart) << 16);
+          if (key !== runKey || keyLight !== runKeyLight) {
+            if (runKey !== 0) {
+              runs[j * CHUNK_SIZE + runStart] = runKey | ((i - runStart) << 16);
+              runLight[j * CHUNK_SIZE + runStart] = runKeyLight;
+            }
             runKey = key;
+            runKeyLight = keyLight;
             runStart = i;
           }
         }
@@ -106,12 +136,15 @@ export function greedyMesh(padded: Uint8Array): MeshResult {
       // Phase 2: vertical merge of identical runs.
       for (let i = 0; i < CHUNK_SIZE; i++) {
         let open = 0;
+        let openLight = 0;
         let startJ = 0;
         for (let j = 0; j <= CHUNK_SIZE; j++) {
           const r = j < CHUNK_SIZE ? runs[j * CHUNK_SIZE + i]! : 0;
-          if (open !== 0 && r === open) continue;
-          if (open !== 0) emitQuad(dir, s, i, startJ, open >>> 16, j - startJ, open & 0xffff, pools);
+          const rl = j < CHUNK_SIZE ? runLight[j * CHUNK_SIZE + i]! : 0;
+          if (open !== 0 && r === open && rl === openLight) continue;
+          if (open !== 0) emitQuad(dir, s, i, startJ, open >>> 16, j - startJ, open & 0xffff, openLight, pools);
           open = r;
+          openLight = rl;
           startJ = j;
         }
       }
@@ -122,21 +155,29 @@ export function greedyMesh(padded: Uint8Array): MeshResult {
     for (let y = 0; y < CHUNK_SIZE; y++) {
       for (let x = 0; x < CHUNK_SIZE; x++) {
         const block = sample(x, y, z);
-        if (isCrossPlant(block)) emitCross(x, y, z, block, cutout);
+        if (isCrossPlant(block)) {
+          emitCross(x, y, z, block, pools.cutout);
+          const l = sampleLight(x, y, z);
+          const word = packQuadLight(l, l, l, l);
+          pools.cutoutLight.push(word, word);
+        }
       }
     }
   }
   return {
-    opaque: Uint32Array.from(opaque),
-    water: Uint32Array.from(water),
-    cutout: Uint32Array.from(cutout),
-    opaqueQuads: opaque.length / 4,
-    waterQuads: water.length / 4,
-    cutoutQuads: cutout.length / 4,
+    opaque: Uint32Array.from(pools.opaque),
+    water: Uint32Array.from(pools.water),
+    cutout: Uint32Array.from(pools.cutout),
+    opaqueLight: Uint32Array.from(pools.opaqueLight),
+    waterLight: Uint32Array.from(pools.waterLight),
+    cutoutLight: Uint32Array.from(pools.cutoutLight),
+    opaqueQuads: pools.opaque.length / 4,
+    waterQuads: pools.water.length / 4,
+    cutoutQuads: pools.cutout.length / 4,
   };
 }
 
-/** Emits the two crossed quads of a plant at (x, y, z): faces 6 (x = z plane) and 7 (x = 1 - z). */
+/** Emits the two crossed quads of a plant or torch at (x, y, z): faces 6 (x = z plane) and 7 (x = 1 - z). */
 export function emitCross(x: number, y: number, z: number, block: number, out: number[]): void {
   out.push(
     packVertex(x, y, z, 6, 3, block), packVertex(x + 1, y, z + 1, 6, 3, block),
@@ -167,6 +208,45 @@ function aoKey(q: number[], u: number, v: number, occ: (x: number, y: number, z:
   return key;
 }
 
+/**
+ * Smoothed light of the four face corners (whose outside cell is q), packed one byte per corner:
+ * each channel is the rounded mean over q and the transparent voxels around the corner.
+ */
+function lightKey(
+  q: number[],
+  u: number,
+  v: number,
+  occ: (x: number, y: number, z: number) => number,
+  sampleLight: (x: number, y: number, z: number) => number,
+): number {
+  const lq = sampleLight(q[0]!, q[1]!, q[2]!);
+  const c = [0, 0, 0];
+  let key = 0;
+  for (let corner = 0; corner < 4; corner++) {
+    const du = corner === 1 || corner === 2 ? 1 : -1;
+    const dv = corner >= 2 ? 1 : -1;
+    let sky = lq >> 4, blk = lq & 15, n = 1;
+    const add = (): void => {
+      const l = sampleLight(c[0]!, c[1]!, c[2]!);
+      sky += l >> 4;
+      blk += l & 15;
+      n++;
+    };
+    c[0] = q[0]!; c[1] = q[1]!; c[2] = q[2]!;
+    c[u] = c[u]! + du;
+    const side1 = occ(c[0]!, c[1]!, c[2]!);
+    if (!side1) add();
+    c[u] = q[u]!;
+    c[v] = c[v]! + dv;
+    const side2 = occ(c[0]!, c[1]!, c[2]!);
+    if (!side2) add();
+    c[u] = c[u]! + du;
+    if (!occ(c[0]!, c[1]!, c[2]!) && !(side1 && side2)) add();
+    key |= ((roundedMean(sky, n) << 4) | roundedMean(blk, n)) << (corner * 8);
+  }
+  return key >>> 0;
+}
+
 function emitQuad(
   dir: number,
   s: number,
@@ -175,7 +255,8 @@ function emitQuad(
   w: number,
   h: number,
   key: number,
-  pools: { opaque: number[]; water: number[]; cutout: number[] },
+  lightKeyValue: number,
+  pools: Pools,
 ): void {
   const a = dir >> 1;
   const u = (a + 1) % 3;
@@ -190,7 +271,9 @@ function emitQuad(
   const flip = ao[0]! + ao[2]! < ao[1]! + ao[3]!;
   const cls = renderClass(block);
   const out = cls === 'water' ? pools.water : cls === 'cutout' ? pools.cutout : pools.opaque;
+  const lightOut = cls === 'water' ? pools.waterLight : cls === 'cutout' ? pools.cutoutLight : pools.opaqueLight;
   const pos = [0, 0, 0];
+  const corners = [0, 0, 0, 0];
   for (let k = 0; k < 4; k++) {
     const corner = order[(k + (flip ? 1 : 0)) & 3]!;
     const cu = corner === 1 || corner === 2 ? 1 : 0;
@@ -199,5 +282,7 @@ function emitQuad(
     pos[u] = i + cu * w;
     pos[v] = j + cv * h;
     out.push(packVertex(pos[0]!, pos[1]!, pos[2]!, dir, ao[corner]!, block));
+    corners[k] = (lightKeyValue >>> (corner * 8)) & 0xff;
   }
+  lightOut.push(packQuadLight(corners[0]!, corners[1]!, corners[2]!, corners[3]!));
 }

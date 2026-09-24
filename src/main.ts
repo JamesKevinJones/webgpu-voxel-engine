@@ -1,13 +1,10 @@
 import './style.css';
-import { installDebugApi } from './core/debug';
-import { DEFAULT_ENGINE_OPTIONS, Engine } from './core/engine';
-import { WebGpuUnavailableError } from './core/gpu-context';
-import { HotbarView } from './core/hotbar';
+import { DEFAULT_ENGINE_OPTIONS, type EngineOptions } from './core/engine';
+import { GpuContext, WebGpuUnavailableError } from './core/gpu-context';
+import { Game } from './ui/game';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#viewport')!;
-const statsRoot = document.querySelector<HTMLElement>('#stats');
 const errorBox = document.querySelector<HTMLElement>('#error')!;
-const hint = document.querySelector<HTMLElement>('#hint');
 
 function showError(title: string, detail: string): void {
   errorBox.hidden = false;
@@ -15,31 +12,32 @@ function showError(title: string, detail: string): void {
   errorBox.querySelector('p')!.textContent = detail;
 }
 
-function intParam(params: URLSearchParams, name: string, fallback: number, min: number, max: number): number {
+function intParam(params: URLSearchParams, name: string, min: number, max: number): number | null {
   const raw = params.get(name);
   const value = raw === null ? Number.NaN : Number.parseInt(raw, 10);
-  return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
+  return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : null;
 }
 
-function floatParam(params: URLSearchParams, name: string, fallback: number): number {
+function floatParam(params: URLSearchParams, name: string): number | null {
   const value = Number.parseFloat(params.get(name) ?? '');
-  return Number.isFinite(value) ? value : fallback;
+  return Number.isFinite(value) ? value : null;
 }
 
 const params = new URLSearchParams(location.search);
-const options = {
-  seed: intParam(params, 'seed', DEFAULT_ENGINE_OPTIONS.seed, 0, 0x7fffffff),
-  radius: intParam(params, 'radius', DEFAULT_ENGINE_OPTIONS.radius, 2, 24),
-  generationBatch: intParam(params, 'gen', DEFAULT_ENGINE_OPTIONS.generationBatch, 1, 32),
-  meshBatch: intParam(params, 'mesh', DEFAULT_ENGINE_OPTIONS.meshBatch, 1, 64),
-  offscreen: params.get('offscreen') === '1',
-  timeOfDay: floatParam(params, 'time', DEFAULT_ENGINE_OPTIONS.timeOfDay),
-  dayLength: floatParam(params, 'daylen', DEFAULT_ENGINE_OPTIONS.dayLength),
-};
+const offscreen = params.get('offscreen') === '1';
+const engine: Partial<EngineOptions> = {};
+const gen = intParam(params, 'gen', 1, 32);
+const mesh = intParam(params, 'mesh', 1, 64);
+const time = floatParam(params, 'time');
+const dayLength = floatParam(params, 'daylen');
+if (gen !== null) engine.generationBatch = gen;
+if (mesh !== null) engine.meshBatch = mesh;
+engine.timeOfDay = time ?? DEFAULT_ENGINE_OPTIONS.timeOfDay;
+if (dayLength !== null) engine.dayLength = dayLength;
 
 try {
-  const engine = await Engine.create(canvas, statsRoot, options);
-  const device = engine.gpu.device;
+  const gpu = await GpuContext.create(canvas, { offscreen });
+  const device = gpu.device;
   device.addEventListener('uncapturederror', (event) => {
     const message = (event as GPUUncapturedErrorEvent).error.message;
     console.error('WebGPU error:', message);
@@ -47,28 +45,22 @@ try {
   });
   void device.lost.then((info) => {
     console.error(`GPU device lost (${info.reason}): ${info.message}`);
-    engine.stop();
-    if (info.reason !== 'destroyed') showError('GPU device lost', info.message || String(info.reason));
+    if (info.reason !== 'destroyed') showError('GPU device lost', `${info.message || String(info.reason)}\nReload the page to continue.`);
   });
-  document.addEventListener('pointerlockchange', () => {
-    if (hint) hint.hidden = document.pointerLockElement === canvas;
+  const game = new Game(gpu, {
+    // Headless automation renders offscreen and cannot use pointer lock: skip the title screen
+    // (unless ?autostart=0 asks for it, to test the menus).
+    autostart: params.get('autostart') === '1' || (offscreen && params.get('autostart') !== '0'),
+    seed: intParam(params, 'seed', 0, 0x7fffffff),
+    radius: intParam(params, 'radius', 2, 24),
+    engine,
   });
-  const hotbarRoot = document.querySelector<HTMLElement>('#hotbar');
-  if (hotbarRoot) {
-    const hotbar = new HotbarView(hotbarRoot, engine.hotbar);
-    const refresh = (): void => {
-      hotbar.update();
-      requestAnimationFrame(refresh);
-    };
-    requestAnimationFrame(refresh);
-  }
-  installDebugApi(engine);
-  engine.start();
+  await game.boot();
 } catch (err) {
   console.error(err);
   if (err instanceof WebGpuUnavailableError) {
-    showError('WebGPU unavailable', `${err.message} Try a recent Chrome, Edge or Safari Technology Preview.`);
+    showError('WebGPU unavailable', `${err.message}\nVoxel Frontier needs WebGPU: try a recent Chrome or Edge (113+), or Safari 26.`);
   } else {
-    showError('Failed to start the engine', err instanceof Error ? err.message : String(err));
+    showError('Failed to start', err instanceof Error ? err.message : String(err));
   }
 }
