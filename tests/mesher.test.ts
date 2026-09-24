@@ -1,0 +1,213 @@
+import { describe, expect, it } from 'vitest';
+import { BlockType, isFaceVisible } from '../src/world/block';
+import { CHUNK_SIZE, SELF_NEIGHBOR_INDEX, neighborIndex } from '../src/world/coords';
+import {
+  FACE_NORMALS,
+  PADDED_SIZE,
+  PADDED_VOLUME,
+  packVertex,
+  paddedIndex,
+  unpackVertex,
+  type UnpackedVertex,
+} from '../src/world/mesh-format';
+import { buildPaddedVolume, greedyMesh, paddedFromSingleChunk, type MeshResult } from '../src/world/mesher';
+import { PalettedChunk } from '../src/world/palette-chunk';
+import { generateChunkDense } from '../src/world/terrain';
+import { mulberry32 } from './helpers';
+
+function volume(fill: (x: number, y: number, z: number) => number): Uint8Array {
+  const v = new Uint8Array(PADDED_VOLUME);
+  for (let z = -1; z <= CHUNK_SIZE; z++) {
+    for (let y = -1; y <= CHUNK_SIZE; y++) {
+      for (let x = -1; x <= CHUNK_SIZE; x++) v[paddedIndex(x + 1, y + 1, z + 1)] = fill(x, y, z);
+    }
+  }
+  return v;
+}
+
+function quads(result: MeshResult): UnpackedVertex[][] {
+  const out: UnpackedVertex[][] = [];
+  for (const list of [result.opaque, result.water]) {
+    for (let q = 0; q < list.length / 4; q++) {
+      out.push([0, 1, 2, 3].map((k) => unpackVertex(list[q * 4 + k]!, { x: 0, y: 0, z: 0, face: 0, ao: 0, block: 0 })));
+    }
+  }
+  return out;
+}
+
+/** Brute-force count of visible faces per direction (what the greedy mesh must cover exactly). */
+function naiveFaceCount(padded: Uint8Array): number {
+  let n = 0;
+  for (let z = 0; z < CHUNK_SIZE; z++) {
+    for (let y = 0; y < CHUNK_SIZE; y++) {
+      for (let x = 0; x < CHUNK_SIZE; x++) {
+        const b = padded[paddedIndex(x + 1, y + 1, z + 1)]!;
+        for (const [dx, dy, dz] of FACE_NORMALS) {
+          if (isFaceVisible(b, padded[paddedIndex(x + 1 + dx!, y + 1 + dy!, z + 1 + dz!)]!)) n++;
+        }
+      }
+    }
+  }
+  return n;
+}
+
+function quadArea(q: UnpackedVertex[]): number {
+  const xs = q.map((v) => v.x), ys = q.map((v) => v.y), zs = q.map((v) => v.z);
+  const ex = Math.max(...xs) - Math.min(...xs), ey = Math.max(...ys) - Math.min(...ys), ez = Math.max(...zs) - Math.min(...zs);
+  return [ex, ey, ez].filter((e) => e > 0).reduce((a, b) => a * b, 1);
+}
+
+/**
+ * Checks the invariants every mesh must satisfy: consistent quads inside the chunk, CCW winding
+ * seen from outside, AO-aware diagonal choice, and exact single coverage of every visible face.
+ * Violations are collected and asserted once (per-vertex expect() calls are far too slow).
+ */
+function checkMeshInvariants(padded: Uint8Array, result: MeshResult): void {
+  const problems: string[] = [];
+  const coverage = new Map<number, number>();
+  let area = 0;
+  for (const q of quads(result)) {
+    const face = q[0]!.face;
+    const [nx, ny, nz] = FACE_NORMALS[face]!;
+    for (const v of q) {
+      if (v.face !== face || v.block !== q[0]!.block) problems.push('inconsistent quad');
+      if ([v.x, v.y, v.z].some((c) => c < 0 || c > CHUNK_SIZE)) problems.push('vertex out of bounds');
+    }
+    const [a, b, c, d] = q as [UnpackedVertex, UnpackedVertex, UnpackedVertex, UnpackedVertex];
+    const e1 = [b.x - a.x, b.y - a.y, b.z - a.z], e2 = [c.x - a.x, c.y - a.y, c.z - a.z];
+    const n = [e1[1]! * e2[2]! - e1[2]! * e2[1]!, e1[2]! * e2[0]! - e1[0]! * e2[2]!, e1[0]! * e2[1]! - e1[1]! * e2[0]!];
+    if (n[0]! * nx! + n[1]! * ny! + n[2]! * nz! <= 0) problems.push(`clockwise quad on face ${face}`);
+    if (a.ao + c.ao < b.ao + d.ao) problems.push('diagonal joins the darker corners');
+    const min = [Math.min(a.x, b.x, c.x, d.x), Math.min(a.y, b.y, c.y, d.y), Math.min(a.z, b.z, c.z, d.z)];
+    const max = [Math.max(a.x, b.x, c.x, d.x), Math.max(a.y, b.y, c.y, d.y), Math.max(a.z, b.z, c.z, d.z)];
+    for (let x = min[0]!; x < Math.max(max[0]!, min[0]! + 1); x++) {
+      for (let y = min[1]!; y < Math.max(max[1]!, min[1]! + 1); y++) {
+        for (let z = min[2]!; z < Math.max(max[2]!, min[2]! + 1); z++) {
+          const key = ((face * 64 + x) * 64 + y) * 64 + z;
+          coverage.set(key, (coverage.get(key) ?? 0) + 1);
+        }
+      }
+    }
+    area += quadArea(q);
+  }
+  for (const count of coverage.values()) if (count !== 1) problems.push('overlapping quads');
+  expect(problems.slice(0, 5)).toEqual([]);
+  expect(area).toBe(naiveFaceCount(padded));
+}
+
+describe('vertex packing', () => {
+  it('round-trips every field', () => {
+    const v = unpackVertex(packVertex(32, 17, 5, 4, 2, BlockType.Basalt), { x: 0, y: 0, z: 0, face: 0, ao: 0, block: 0 });
+    expect(v).toEqual({ x: 32, y: 17, z: 5, face: 4, ao: 2, block: BlockType.Basalt });
+    expect(packVertex(32, 32, 32, 5, 3, 15)).toBeLessThan(2 ** 32);
+  });
+});
+
+describe('greedy mesher', () => {
+  it('emits 6 quads for a single block', () => {
+    const padded = volume((x, y, z) => (x === 3 && y === 4 && z === 5 ? BlockType.Stone : BlockType.Air));
+    const r = greedyMesh(padded);
+    expect(r.opaqueQuads).toBe(6);
+    expect(r.waterQuads).toBe(0);
+    checkMeshInvariants(padded, r);
+    for (const q of quads(r)) for (const v of q) expect(v.ao).toBe(3);
+  });
+
+  it('merges coplanar faces of identical blocks', () => {
+    const padded = volume((x, y, z) => (y === 0 && x >= 2 && x < 10 && z >= 4 && z < 7 ? BlockType.Grass : BlockType.Air));
+    const r = greedyMesh(padded);
+    expect(r.opaqueQuads).toBe(6);
+    checkMeshInvariants(padded, r);
+  });
+
+  it('does not merge faces of different block types', () => {
+    const padded = volume((x, y, z) => (y === 0 && z === 0 && x >= 0 && x < 4 ? (x < 2 ? BlockType.Stone : BlockType.Dirt) : BlockType.Air));
+    const r = greedyMesh(padded);
+    // top/bottom/front/back split per type (4 × 2) + two end caps.
+    expect(r.opaqueQuads).toBe(10);
+    checkMeshInvariants(padded, r);
+  });
+
+  it('covers a full chunk with one quad per side and culls hidden faces', () => {
+    const solid = volume((x, y, z) => (x >= 0 && y >= 0 && z >= 0 && x < 32 && y < 32 && z < 32 ? BlockType.Stone : BlockType.Air));
+    const r = greedyMesh(solid);
+    expect(r.opaqueQuads).toBe(6);
+    checkMeshInvariants(solid, r);
+    const buried = volume(() => BlockType.Stone);
+    expect(greedyMesh(buried).opaqueQuads).toBe(0);
+  });
+
+  it('computes per-vertex ambient occlusion from the 26-neighbourhood', () => {
+    // Block at (5,5,5) with an occluder diagonally above in +X: its top face corners at x=6
+    // see one side occluder (AO 2), the corners at x=5 are open (AO 3).
+    const padded = volume((x, y, z) =>
+      (x === 5 && y === 5 && z === 5) || (x === 6 && y === 6 && z === 5) ? BlockType.Stone : BlockType.Air);
+    const r = greedyMesh(padded);
+    checkMeshInvariants(padded, r);
+    const top = quads(r).find((q) => q[0]!.face === 2 && q[0]!.y === 6 && q.every((v) => v.x <= 6 && v.x >= 5 && v.z >= 5 && v.z <= 6));
+    expect(top).toBeDefined();
+    for (const v of top!) expect(v.ao).toBe(v.x === 6 ? 2 : 3);
+  });
+
+  it('fully occludes corners enclosed by two side neighbours', () => {
+    // Floor with walls on -X and -Z: the floor corner in the inner edge gets AO 0.
+    const padded = volume((x, y, z) => (y === 0 || (y === 1 && (x === 0 || z === 0)) ? BlockType.Stone : BlockType.Air));
+    const r = greedyMesh(padded);
+    checkMeshInvariants(padded, r);
+    const aoAtCorner = quads(r)
+      .filter((q) => q[0]!.face === 2 && q[0]!.y === 1)
+      .flatMap((q) => q.filter((v) => v.x === 1 && v.z === 1).map((v) => v.ao));
+    expect(aoAtCorner).toContain(0);
+  });
+
+  it('treats water as translucent: separate pool, culled against itself and opaque blocks', () => {
+    // Stone floor at y=0, water from y=1 to y=3.
+    const padded = volume((x, y, z) => {
+      if (x < 0 || z < 0 || x >= 32 || z >= 32 || y < 0 || y >= 32) return BlockType.Air;
+      return y === 0 ? BlockType.Stone : y <= 3 ? BlockType.Water : BlockType.Air;
+    });
+    const r = greedyMesh(padded);
+    checkMeshInvariants(padded, r);
+    const water = quads({ ...r, opaque: new Uint32Array() });
+    expect(water.every((q) => q[0]!.block === BlockType.Water)).toBe(true);
+    // Water faces: top plane + 4 sides (against air); none against the stone below.
+    expect(r.waterQuads).toBe(5);
+    expect(water.some((q) => q[0]!.face === 3)).toBe(false);
+    // Stone: its top face is visible through the water, bottom and 4 sides against air.
+    expect(r.opaqueQuads).toBe(6);
+  });
+
+  it('respects neighbour chunks through the padded border', () => {
+    const solid = new PalettedChunk(BlockType.Stone);
+    const neighbors: (PalettedChunk | null)[] = new Array(27).fill(null);
+    neighbors[SELF_NEIGHBOR_INDEX] = solid;
+    neighbors[neighborIndex(1, 0, 0)] = solid;
+    neighbors[neighborIndex(0, 1, 0)] = solid;
+    const padded = buildPaddedVolume(neighbors);
+    expect(padded[paddedIndex(PADDED_SIZE - 1, 5, 5)]).toBe(BlockType.Stone);
+    expect(padded[paddedIndex(0, 5, 5)]).toBe(BlockType.Air);
+    const r = greedyMesh(padded);
+    const faces = new Set(quads(r).map((q) => q[0]!.face));
+    expect(faces).toEqual(new Set([1, 3, 4, 5])); // +X and +Y are hidden by the neighbours
+    checkMeshInvariants(padded, r);
+  });
+
+  it('satisfies coverage/area invariants on random volumes', () => {
+    const rand = mulberry32(2024);
+    for (let trial = 0; trial < 4; trial++) {
+      const density = 0.2 + trial * 0.2;
+      const padded = volume(() => (rand() < density ? 1 + Math.floor(rand() * 6) : BlockType.Air));
+      checkMeshInvariants(padded, greedyMesh(padded));
+    }
+  });
+
+  it('meshes generated terrain and merges aggressively', () => {
+    const chunk = PalettedChunk.fromDense(generateChunkDense(0, 0, 0, 1337));
+    const padded = paddedFromSingleChunk(chunk);
+    const r = greedyMesh(padded);
+    checkMeshInvariants(padded, r);
+    const faces = naiveFaceCount(padded);
+    expect(r.opaqueQuads + r.waterQuads).toBeGreaterThan(0);
+    expect(r.opaqueQuads + r.waterQuads).toBeLessThan(faces);
+  });
+});
