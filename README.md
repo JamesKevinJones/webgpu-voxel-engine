@@ -2,6 +2,13 @@
 
 **Play it:** <https://jameskevinjones.github.io/webgpu-voxel-engine/> (needs a WebGPU browser: Chrome / Edge 113+, or Safari 26)
 
+[![CI](https://github.com/JamesKevinJones/webgpu-voxel-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/JamesKevinJones/webgpu-voxel-engine/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+![Snowy Mountains biome: a snow-capped peak, conifers, frozen water, shadows and distance fog](docs/img/snowy-mountains.jpg)
+
+<sub>A real frame at 1280x800 (seed 1337, Snowy Mountains), rendered on an RTX 4050 and read back through the engine's offscreen debug capture (`?offscreen=1`, `__voxel.screenshot()`).</sub>
+
 A chunk-based voxel sandbox written in TypeScript and raw WGSL, with no runtime dependencies. The GPU does the heavy work in compute shaders: world generation, greedy meshing and particle simulation. Chunks are drawn with one `drawIndexedIndirect` call each, using arguments that the GPU mesher writes itself. The CPU streams chunks, floods voxel light, runs the water automaton and player physics, and keeps a palette-compressed copy of the world for raycasting, edits and saving.
 
 - **Terrain**: climate-driven terrain with four biomes (plains, desert, snowy mountains, dense forest), caves, trees and plants
@@ -285,7 +292,11 @@ Add a few MB for the depth buffer, textures, the 1024 particles, the per-job lig
 
 It writes screenshots to `scripts/out/`. Headless Chromium can't present a WebGPU canvas without a display, so the test renders offscreen and captures frames through the debug API (`globalThis.__voxel`).
 
-CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run build` and `npm test` on every push to `main`.
+CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run build` and `npm test` on every push to `main` and on every pull request. The GPU smoke test isn't in CI: it needs a WebGPU adapter.
+
+## What broke and what I learned
+
+Two of the 215 unit tests failed on Windows while passing on Linux CI. The WGSL loader resolves `#include` paths with `path.resolve`, which returns `C:\s\b.wgsl` on Windows, but the test's fake filesystem was keyed by POSIX paths. The loader was right and the fixture was wrong, so the fix went in the test. The lesson: a CI matrix of one OS hides path assumptions. Capturing frames taught a second one. A headless browser can't present a WebGPU canvas without a display, so the engine renders into an offscreen texture and copies it out on demand. That's also how the screenshot above was taken.
 
 ## Deployment
 
