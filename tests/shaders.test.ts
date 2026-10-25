@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { FRAME_BYTES, FRAME_FLOATS, FRAME_LAYOUT } from '../src/core/uniforms';
 import { SHADER_CONSTANTS, shaderPrelude, withPrelude } from '../src/gpu/shader-prelude';
@@ -34,10 +34,12 @@ function stripComments(src: string): string {
 }
 
 describe('WGSL loader', () => {
+  // Keys go through path.resolve like the loader's own paths, so the fake
+  // filesystem also matches on Windows ("C:\s\b.wgsl").
   const files: Record<string, string> = {
-    '/s/a.wgsl': '#include "b.wgsl"\n#include "lib/c.wgsl"\nfn a() {}',
-    '/s/b.wgsl': '#include "lib/c.wgsl"\nfn b() {}',
-    '/s/lib/c.wgsl': 'fn c() {}',
+    [resolve('/s/a.wgsl')]: '#include "b.wgsl"\n#include "lib/c.wgsl"\nfn a() {}',
+    [resolve('/s/b.wgsl')]: '#include "lib/c.wgsl"\nfn b() {}',
+    [resolve('/s/lib/c.wgsl')]: 'fn c() {}',
   };
   const readFile = (p: string): string => {
     const f = files[p];
@@ -46,7 +48,7 @@ describe('WGSL loader', () => {
   };
 
   it('expands nested includes relative to the including file, once each', () => {
-    const out = resolveWgslIncludes(files['/s/a.wgsl']!, '/s/a.wgsl', readFile);
+    const out = resolveWgslIncludes(files[resolve('/s/a.wgsl')]!, '/s/a.wgsl', readFile);
     expect(out.match(/fn c\(\)/g)).toHaveLength(1);
     expect(out.indexOf('fn c()')).toBeLessThan(out.indexOf('fn b()'));
     expect(out).toContain('fn a() {}');
@@ -55,8 +57,8 @@ describe('WGSL loader', () => {
 
   it('reports dependencies for hot reload', () => {
     const deps: string[] = [];
-    resolveWgslIncludes(files['/s/a.wgsl']!, '/s/a.wgsl', readFile, undefined, (d) => deps.push(d));
-    expect(deps.sort()).toEqual(['/s/b.wgsl', '/s/lib/c.wgsl']);
+    resolveWgslIncludes(files[resolve('/s/a.wgsl')]!, '/s/a.wgsl', readFile, undefined, (d) => deps.push(d));
+    expect(deps.sort()).toEqual([resolve('/s/b.wgsl'), resolve('/s/lib/c.wgsl')]);
   });
 
   it('is applied to imported shader modules', () => {
